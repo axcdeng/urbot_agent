@@ -1,0 +1,1 @@
+"""WATER API adapter package."""

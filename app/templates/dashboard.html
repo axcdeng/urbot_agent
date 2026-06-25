@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>alex_agent Dashboard</title>
+    <style>
+      body {
+        font-family: "SF Mono", Menlo, Monaco, Consolas, monospace;
+        background: linear-gradient(135deg, #f4efe4, #d7e4ef);
+        color: #13222f;
+        margin: 0;
+        padding: 24px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 16px;
+      }
+      .card {
+        background: rgba(255, 255, 255, 0.8);
+        border: 1px solid rgba(19, 34, 47, 0.15);
+        border-radius: 16px;
+        padding: 16px;
+        box-shadow: 0 10px 30px rgba(19, 34, 47, 0.08);
+      }
+      h1, h2 { margin-top: 0; }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: rgba(19, 34, 47, 0.05);
+        border-radius: 12px;
+        padding: 12px;
+        min-height: 120px;
+      }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        margin-right: 8px;
+        background: #13222f;
+        color: #fff;
+        cursor: pointer;
+      }
+      button.warn { background: #a33a2b; }
+      input {
+        width: 100%;
+        padding: 12px;
+        border-radius: 12px;
+        border: 1px solid rgba(19, 34, 47, 0.2);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>alex_agent</h1>
+    <div class="grid">
+      <section class="card">
+        <h2>Robot State</h2>
+        <button id="refresh-button">Refresh</button>
+        <button class="warn" id="cancel-button">Cancel Move</button>
+        <button class="warn" id="estop-button">Emergency Stop</button>
+        <pre id="robot-state">Loading...</pre>
+      </section>
+      <section class="card">
+        <h2>Locations</h2>
+        <pre id="locations">Loading...</pre>
+      </section>
+      <section class="card">
+        <h2>Tasks</h2>
+        <pre id="tasks">Loading...</pre>
+      </section>
+      <section class="card">
+        <h2>Missions</h2>
+        <pre id="missions">Loading...</pre>
+      </section>
+      <section class="card">
+        <h2>Agent Chat</h2>
+        <input id="chat-input" placeholder="Send a robot command..." />
+        <button id="chat-button">Send</button>
+        <pre id="chat-output">No message sent yet.</pre>
+      </section>
+    </div>
+    <script src="/static/dashboard.js"></script>
+  </body>
+  </html>
