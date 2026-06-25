@@ -43,3 +43,6 @@ coverage.xml
 .idea/
 .vscode/
 *.swp
+
+# Docs kept local only (removed from remote)
+README.md
