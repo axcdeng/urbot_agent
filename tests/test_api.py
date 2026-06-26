@@ -19,7 +19,7 @@ def build_test_client(tmp_path: Path) -> TestClient:
 def test_health_and_task_routes(tmp_path: Path):
     with build_test_client(tmp_path) as client:
         assert client.get("/health").json()["ok"] is True
-        task = client.post("/tasks/move-marker", json={"marker_name": "room_205"}).json()
+        task = client.post("/tasks/move-marker", json={"marker_name": "front_desk"}).json()
         assert task["task_type"] == "move_marker"
         assert client.get(f"/tasks/{task['task_id']}").status_code == 200
 
@@ -29,10 +29,10 @@ def test_agent_chat_json_fallback(tmp_path: Path):
         planner = client.app.state.services.agent_planner
         planner.llm_client.chat_with_tools = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("unsupported"))  # type: ignore[method-assign]
         planner.llm_client.json_plan = lambda prompt: {  # type: ignore[method-assign]
-            "response": "Sending the robot to room 205.",
-            "action": {"tool": "move_to_location", "arguments": {"location_name": "room_205"}},
+            "response": "Sending the robot to the front desk.",
+            "action": {"tool": "move_to_location", "arguments": {"location_name": "front_desk"}},
         }
-        response = client.post("/agent/chat", json={"message": "Go to room 205"})
+        response = client.post("/agent/chat", json={"message": "Go to the front desk"})
         payload = response.json()
         assert response.status_code == 200
         assert payload["created_task_ids"]
@@ -40,7 +40,7 @@ def test_agent_chat_json_fallback(tmp_path: Path):
 
 def test_agent_chat_creates_mission_for_multistep_request(tmp_path: Path):
     with build_test_client(tmp_path) as client:
-        response = client.post("/agent/chat", json={"message": "Go to room 205, then wait 1 second, then return to charger"})
+        response = client.post("/agent/chat", json={"message": "Go to front desk, then wait 1 second, then return to charger"})
         payload = response.json()
         assert response.status_code == 200
         assert payload["created_mission_ids"]
@@ -54,9 +54,9 @@ def test_mission_routes(tmp_path: Path):
         response = client.post(
             "/missions",
             json={
-                "user_request": "Go to room 205 then return to charger",
+                "user_request": "Go to the front desk then return to charger",
                 "steps": [
-                    {"step_type": "move_marker", "marker_name": "room_205"},
+                    {"step_type": "move_marker", "marker_name": "front_desk"},
                     {"step_type": "return_to_charger"},
                 ],
                 "auto_replan": True,

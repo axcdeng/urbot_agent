@@ -14,10 +14,12 @@ def test_alias_resolution_and_marker_sync(tmp_path: Path):
     registry = LocationRegistry(session_factory, WaterRobotClient(settings))
     registry.sync_markers()
     resolved = registry.resolve_location("charger")
-    assert resolved.marker_name == "charging"
+    assert resolved.marker_name == "charge_point_1F_1"
     registry.add_alias("lobby drop", "front_desk")
     resolved_alias = registry.resolve_location("lobby drop")
     assert resolved_alias.marker_name == "front_desk"
+    # Mixed-case input resolves to the canonical marker name sent to the robot.
+    assert registry.resolve_location("MEETINGROOM").marker_name == "Meetingroom"
 
 
 def test_unknown_location_returns_none(tmp_path: Path):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.models import LocationAlias, MarkerCache
@@ -11,12 +11,17 @@ from app.water.client import WaterRobotClient
 from app.water.normalizer import normalize_marker_response
 
 
+# Friendly names mapped to canonical marker names on the deployed 1F map.
+# Alias targets must be real marker names; resolution verifies they exist.
 DEFAULT_ALIASES = {
-    "charger": "charging",
-    "charging station": "charging",
-    "room 205": "room_205",
-    "kitchen pickup": "kitchen_pickup",
+    "charger": "charge_point_1F_1",
+    "charging station": "charge_point_1F_1",
     "front desk": "front_desk",
+    "reception": "toReception",
+    "meeting room": "Meetingroom",
+    "kitchen": "Kitchen",
+    "security": "securitycheck",
+    "security check": "securitycheck",
 }
 
 
@@ -85,16 +90,33 @@ class LocationRegistry:
         finally:
             session.close()
 
+    def _canonical_marker_name(self, session, name: str) -> str | None:
+        """Return the stored (canonical) marker name, matching case-insensitively.
+
+        Marker names are sent verbatim to the robot, so the original casing
+        must be preserved even when the user/LLM supplies a different case.
+        """
+        marker = session.get(MarkerCache, name)
+        if marker is not None:
+            return marker.marker_name
+        target = name.strip().lower()
+        row = session.scalars(
+            select(MarkerCache).where(func.lower(MarkerCache.marker_name) == target)
+        ).first()
+        return row.marker_name if row is not None else None
+
     def resolve_location(self, name: str) -> ResolvedLocation:
         normalized = name.strip().lower()
         session = self.session_factory()
         try:
             alias = session.get(LocationAlias, normalized)
             if alias is not None:
-                return ResolvedLocation(requested_name=name, marker_name=alias.marker_name, source="alias")
-            marker = session.get(MarkerCache, normalized)
-            if marker is not None:
-                return ResolvedLocation(requested_name=name, marker_name=marker.marker_name, source="marker")
+                canonical = self._canonical_marker_name(session, alias.marker_name)
+                if canonical is not None:
+                    return ResolvedLocation(requested_name=name, marker_name=canonical, source="alias")
+            canonical = self._canonical_marker_name(session, name)
+            if canonical is not None:
+                return ResolvedLocation(requested_name=name, marker_name=canonical, source="marker")
         finally:
             session.close()
         return ResolvedLocation(requested_name=name, marker_name=None, source="unknown")

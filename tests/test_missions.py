@@ -32,9 +32,9 @@ def build_mission_manager(tmp_path: Path) -> tuple[MissionManager, TaskManager, 
 def test_mission_runs_steps_sequentially(tmp_path: Path):
     mission_manager, task_manager, _ = build_mission_manager(tmp_path)
     mission = mission_manager.create_mission(
-        user_request="Go to room 205 then wait then return to charger",
+        user_request="Go to the front desk then wait then return to charger",
         steps=[
-            {"step_type": "move_marker", "marker_name": "room_205"},
+            {"step_type": "move_marker", "marker_name": "front_desk"},
             {"step_type": "wait", "wait_seconds": 1},
             {"step_type": "return_to_charger"},
         ],
@@ -64,8 +64,8 @@ def test_mission_runs_steps_sequentially(tmp_path: Path):
 def test_mission_replan_uses_compact_context(tmp_path: Path):
     mission_manager, task_manager, mission_planner = build_mission_manager(tmp_path)
     mission = mission_manager.create_mission(
-        user_request="Go to room 205 then return to charger",
-        steps=[{"step_type": "move_marker", "marker_name": "room_205"}],
+        user_request="Go to the front desk then return to charger",
+        steps=[{"step_type": "move_marker", "marker_name": "front_desk"}],
         auto_replan=True,
     )
     mission_id = mission["mission_id"]
@@ -75,7 +75,7 @@ def test_mission_replan_uses_compact_context(tmp_path: Path):
         "task_id": task_id,
         "task_type": "move_marker",
         "status": "failed",
-        "requested_target": "room_205",
+        "requested_target": "front_desk",
         "robot_task_id": "robot-1",
         "mission_id": mission_id,
         "mission_step_id": mission["steps"][0]["step_id"],
@@ -85,9 +85,9 @@ def test_mission_replan_uses_compact_context(tmp_path: Path):
         "completed_at": None,
     }
     mission_planner.replan_steps = lambda context: {  # type: ignore[method-assign]
-        "response": "Use the kitchen pickup route first.",
+        "response": "Use the kitchen route first.",
         "steps": [
-            {"step_type": "move_marker", "marker_name": "kitchen_pickup"},
+            {"step_type": "move_marker", "marker_name": "Kitchen"},
             {"step_type": "return_to_charger"},
         ],
     }
@@ -96,7 +96,7 @@ def test_mission_replan_uses_compact_context(tmp_path: Path):
     replanned = mission_manager.get_mission(mission_id)
     assert replanned["replan_count"] == 1
     assert replanned["status"] == "running"
-    assert "Use the kitchen pickup route first." in (replanned["error_message"] or "")
+    assert "Use the kitchen route first." in (replanned["error_message"] or "")
 
 
 def test_compact_summary_rolls_up_older_completed_steps(tmp_path: Path):

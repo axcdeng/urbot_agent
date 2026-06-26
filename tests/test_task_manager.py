@@ -24,7 +24,7 @@ def build_manager(tmp_path: Path) -> TaskManager:
 
 def test_move_task_lifecycle_in_dry_run(tmp_path: Path):
     manager = build_manager(tmp_path)
-    task = manager.create_move_marker_task("room_205")
+    task = manager.create_move_marker_task("front_desk")
     assert task["status"] == "running"
     manager.poll_active_tasks()
     manager.poll_active_tasks()

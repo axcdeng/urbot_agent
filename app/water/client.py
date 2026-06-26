@@ -12,42 +12,164 @@ from app.config import Settings
 from app.water.schemas import WaterClientError, WaterEnvelope
 
 
+# Dry-run marker map. Mirrors the shape returned by the real WATER
+# `/api/markers/query_list` (results keyed by marker_name, pose.position and
+# pose.orientation as dicts) so the normalizer treats dry-run and live identically.
+# Sourced from the deployed 1F waypoint export (position [x,y,z], orientation
+# quaternion [x,y,z,w]). Duplicate marker names are intentionally absent.
 DRY_MARKERS = {
-    "charging": {
+    "summon_point_5": {
+        "marker_name": "summon_point_5",
+        "key": 0,
         "floor": 1,
         "pose": {
-            "position": {"x": 0.0, "y": 0.0, "z": 0.0},
-            "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+            "position": {"x": 0.27, "y": 9.98, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.69, "w": -0.73},
         },
-        "marker_name": "charging",
+    },
+    "charge_point_1F_1": {
+        "marker_name": "charge_point_1F_1",
         "key": 11,
-    },
-    "room_205": {
-        "floor": 2,
-        "pose": {
-            "position": {"x": 12.0, "y": 4.0, "z": 0.0},
-            "orientation": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
-        },
-        "marker_name": "room_205",
-        "key": 0,
-    },
-    "kitchen_pickup": {
         "floor": 1,
         "pose": {
-            "position": {"x": 3.5, "y": 8.25, "z": 0.0},
-            "orientation": {"w": 0.9239, "x": 0.0, "y": 0.0, "z": 0.3827},
+            "position": {"x": 4.11, "y": -9.06, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.006},
         },
-        "marker_name": "kitchen_pickup",
+    },
+    "toReception": {
+        "marker_name": "toReception",
         "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": -19.05, "y": -12.35, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.72, "w": -0.7},
+        },
+    },
+    "Meetingroom": {
+        "marker_name": "Meetingroom",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 3.39, "y": 11.41, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.03, "w": -1.0},
+        },
+    },
+    "sweep_start_1F_test2": {
+        "marker_name": "sweep_start_1F_test2",
+        "key": 50,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 2.52, "y": -10.1, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.72, "w": -0.7},
+        },
+    },
+    "waiting": {
+        "marker_name": "waiting",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 1.78, "y": -9.31, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": -0.71, "w": 0.7},
+        },
+    },
+    "securitycheck": {
+        "marker_name": "securitycheck",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": -16.14, "y": 9.4, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": -0.68, "w": -0.73},
+        },
+    },
+    "map_1": {
+        "marker_name": "map_1",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 2.2, "y": -15.02, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.68, "w": 0.73},
+        },
     },
     "front_desk": {
-        "floor": 1,
-        "pose": {
-            "position": {"x": -4.0, "y": 2.0, "z": 0.0},
-            "orientation": {"w": 0.7071, "x": 0.0, "y": 0.0, "z": 0.7071},
-        },
         "marker_name": "front_desk",
         "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 1.23, "y": -5.12, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.74, "w": -0.67},
+        },
+    },
+    "sweep_start_1F_carpet": {
+        "marker_name": "sweep_start_1F_carpet",
+        "key": 50,
+        "floor": 1,
+        "pose": {
+            "position": {"x": -7.42, "y": -13.36, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": -0.01},
+        },
+    },
+    "扫地机维护点_1F_1": {
+        "marker_name": "扫地机维护点_1F_1",
+        "key": 51,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 2.33, "y": -9.33, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": -0.71, "w": 0.7},
+        },
+    },
+    "sweep_start_1F_23": {
+        "marker_name": "sweep_start_1F_23",
+        "key": 50,
+        "floor": 1,
+        "pose": {
+            "position": {"x": -18.81, "y": -10.76, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": -0.68, "w": -0.73},
+        },
+    },
+    "sweep_start_1F_test": {
+        "marker_name": "sweep_start_1F_test",
+        "key": 50,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 2.37, "y": -2.69, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.71, "w": -0.71},
+        },
+    },
+    "charge_point_1F_40300165": {
+        "marker_name": "charge_point_1F_40300165",
+        "key": 11,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 4.43, "y": -6.91, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.009},
+        },
+    },
+    "charge_point_1F_40300423": {
+        "marker_name": "charge_point_1F_40300423",
+        "key": 11,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 4.25, "y": -8.19, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.03},
+        },
+    },
+    "Kitchen": {
+        "marker_name": "Kitchen",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 0.48, "y": -14.87, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.74, "w": 0.67},
+        },
+    },
+    "Demotest": {
+        "marker_name": "Demotest",
+        "key": 0,
+        "floor": 1,
+        "pose": {
+            "position": {"x": 2.43, "y": -8.0, "z": 0.0},
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.72, "w": -0.69},
+        },
     },
 }
 
