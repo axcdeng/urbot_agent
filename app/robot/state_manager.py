@@ -11,15 +11,30 @@ class StateManager:
     def __init__(self, client: WaterRobotClient):
         self.client = client
 
+    def _optional_call(self, fn):
+        """Best-effort supplementary call; returns None if the endpoint fails.
+
+        Some firmware/units don't implement every read endpoint (e.g.
+        /api/get_current_location can 404), and those are supplementary —
+        robot_status already carries pose/floor. A failure here must not
+        make the robot look offline or block moves.
+        """
+        try:
+            return fn()
+        except WaterClientError:
+            return None
+
     def get_robot_state(self):
+        # robot_status is authoritative for online/e-stop/move state; if it
+        # fails the robot is genuinely unreachable.
         try:
             status = self.client.get_robot_status()
-            power = self.client.get_power_status()
-            location = self.client.get_current_location()
         except WaterClientError as exc:
             return normalize_robot_state(
                 type("OfflineEnvelope", (), {"status": "UNKNOWN_ERROR", "results": None, "error_message": str(exc), "model_dump": lambda self, mode="json": {"status": "UNKNOWN_ERROR", "error_message": str(exc)}})()
             )
+        power = self._optional_call(self.client.get_power_status)
+        location = self._optional_call(self.client.get_current_location)
         return normalize_robot_state(status, power, location)
 
     def get_compact_robot_state(self) -> dict[str, Any]:
