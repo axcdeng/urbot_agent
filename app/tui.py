@@ -29,6 +29,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.main import ServiceContainer, build_services
+from app.robot.profiles import ROBOT_PROFILES
 
 
 # --------------------------------------------------------------------------- #
@@ -45,6 +46,7 @@ HELP_LINES = [
     "[b]Commands[/b]",
     "  /dryrun [on|off]   show or toggle dry-run (simulated vs live robot)",
     "  /ip [host[:port]]  show or switch the robot address",
+    "  /ip <profile>      switch robot + map by profile (primary, secondary)",
     "  /status            current robot state",
     "  /markers           known markers and aliases",
     "  /release           release the soft e-stop",
@@ -97,6 +99,26 @@ class AgentConsole:
         if port is not None:
             self.services.settings.water_http_port = port
 
+    def current_profile(self) -> str | None:
+        s = self.services.settings
+        for name, profile in ROBOT_PROFILES.items():
+            if profile.host == s.water_robot_host and profile.port == s.water_http_port:
+                return name
+        return None
+
+    def use_profile(self, name: str) -> int:
+        """Switch to a named profile: its address AND its marker map.
+
+        Returns the number of markers loaded.
+        """
+        profile = ROBOT_PROFILES[name]
+        self.set_robot_host(profile.host, profile.port)
+        # Make both the dry-run simulation and the agent's resolution cache use
+        # this profile's map.
+        self.services.client.set_dry_markers(profile.markers)
+        loaded = self.services.location_registry.load_marker_map(profile.markers)
+        return len(loaded)
+
     def chat(self, message: str) -> dict[str, Any]:
         return self.services.agent_planner.run_chat(message)
 
@@ -138,12 +160,24 @@ class AgentConsole:
             return CommandResult(["usage: /dryrun on|off"])
 
         if cmd == "ip":
+            profiles = ", ".join(ROBOT_PROFILES)
             if not args:
-                return CommandResult([f"robot address is {self.robot_addr} (target {self.live_target})"])
+                here = self.current_profile()
+                label = f" [{here}]" if here else ""
+                return CommandResult([
+                    f"robot address is {self.robot_addr}{label} (target {self.live_target})",
+                    f"profiles: {profiles}",
+                ])
+            name = args[0].lower()
+            if name in ROBOT_PROFILES:
+                count = self.use_profile(name)
+                return CommandResult([
+                    f"switched to profile [b]{name}[/b] -> {self.robot_addr}; loaded {count} markers"
+                ])
             host, _, port = args[0].partition(":")
             host = host.strip()
             if not host:
-                return CommandResult(["usage: /ip <host>[:port]"])
+                return CommandResult([f"usage: /ip <host>[:port] | <profile> ({profiles})"])
             if port:
                 try:
                     self.set_robot_host(host, int(port))
@@ -331,9 +365,11 @@ if _TEXTUAL_AVAILABLE:
                 state = {"online": False, "move_status": f"err: {exc}"}
             mode = "[green]DRY[/green]" if self.ctl.dry_run else "[red]LIVE[/red]"
             busy = " · [yellow]working…[/yellow]" if self._busy else ""
+            profile = self.ctl.current_profile()
+            addr = f"{self.ctl.robot_addr}" + (f" ({profile})" if profile else "")
             self.call_from_thread(
                 self.status_widget.update,
-                f"{mode} {self.ctl.robot_addr} · {_format_status(state)}{busy}",
+                f"{mode} {addr} · {_format_status(state)}{busy}",
             )
 
         # ----- rendering helpers ------------------------------------------ #

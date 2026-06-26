@@ -56,6 +56,24 @@ def test_ip_command_switches_robot_address(tmp_path: Path):
     assert console.services.settings.water_http_port == 8000
 
 
+def test_ip_profile_switches_address_and_map(tmp_path: Path):
+    console = build_console(tmp_path)
+
+    out = console.run_command("/ip secondary")
+    assert "secondary" in out.lines[0]
+    assert console.services.settings.water_robot_host == "10.1.16.160"
+    assert console.services.settings.water_http_port == 9001
+    assert console.current_profile() == "secondary"
+    # map is loaded and resolvable; dry simulation uses it too
+    assert console.services.client.get_transport_url("/api/move").startswith("http://10.1.16.160:9001")
+    assert console.services.location_registry.resolve_location("Meetingroom").marker_name == "Meetingroom"
+    assert "front_desk" in console.services.client.dry_markers
+
+    console.run_command("/ip primary")
+    assert console.services.settings.water_robot_host == "10.1.17.225"
+    assert console.current_profile() == "primary"
+
+
 def test_meta_commands(tmp_path: Path):
     console = build_console(tmp_path)
     assert console.run_command("/help").lines

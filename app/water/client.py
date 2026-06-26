@@ -219,6 +219,9 @@ class WaterRobotClient:
         self.settings = settings
         self.http_transport = HttpWaterTransport(settings)
         self.tcp_transport = TcpWaterTransportPlaceholder(settings)
+        # Active map used by the dry-run simulation; swappable at runtime so a
+        # profile switch (e.g. /ip secondary) can present a different map.
+        self.dry_markers: dict[str, Any] = dict(DRY_MARKERS)
         self._dry_state = {
             "soft_estop": False,
             "hard_estop": False,
@@ -243,6 +246,9 @@ class WaterRobotClient:
 
     def get_transport_url(self, path: str, params: dict[str, Any] | None = None) -> str:
         return self.http_transport.build_url(path, params)
+
+    def set_dry_markers(self, markers: dict[str, Any]) -> None:
+        self.dry_markers = dict(markers)
 
     def _request(self, path: str, params: dict[str, Any] | None = None) -> WaterEnvelope:
         if self.dry_run:
@@ -280,7 +286,7 @@ class WaterRobotClient:
         }
 
     def _move_to_marker_pose(self, marker_name: str) -> dict[str, Any] | None:
-        marker = DRY_MARKERS.get(marker_name)
+        marker = self.dry_markers.get(marker_name)
         if not marker:
             return None
         position = marker["pose"]["position"]
@@ -323,7 +329,7 @@ class WaterRobotClient:
             marker_name = self._dry_state["current_marker"]
             near_markers = []
             if marker_name:
-                near_markers.append({"distance": 0.1, "key": DRY_MARKERS[marker_name]["key"], "marker_name": marker_name})
+                near_markers.append({"distance": 0.1, "key": self.dry_markers.get(marker_name, {}).get("key", 0), "marker_name": marker_name})
             return WaterEnvelope(
                 command=path,
                 status="OK",
@@ -336,10 +342,10 @@ class WaterRobotClient:
             )
 
         if path == "/api/markers/query_list":
-            return WaterEnvelope(command=path, status="OK", results=copy.deepcopy(DRY_MARKERS))
+            return WaterEnvelope(command=path, status="OK", results=copy.deepcopy(self.dry_markers))
 
         if path == "/api/markers/query_brief":
-            brief = {name: f"{payload['key']}-{payload['floor']}" for name, payload in DRY_MARKERS.items()}
+            brief = {name: f"{payload['key']}-{payload['floor']}" for name, payload in self.dry_markers.items()}
             return WaterEnvelope(command=path, status="OK", results=brief)
 
         if path == "/api/map/get_current_map":

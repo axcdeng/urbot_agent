@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from app.models import LocationAlias, MarkerCache
 from app.water.client import WaterRobotClient
 from app.water.normalizer import normalize_marker_response
+from app.water.schemas import WaterEnvelope
 
 
 # Friendly names mapped to canonical marker names on the deployed 1F map.
@@ -49,9 +51,7 @@ class LocationRegistry:
         finally:
             session.close()
 
-    def sync_markers(self) -> list[dict[str, Any]]:
-        envelope = self.client.query_markers()
-        markers = normalize_marker_response(envelope)
+    def _store_markers(self, markers: list[dict[str, Any]]) -> None:
         session = self.session_factory()
         try:
             session.query(MarkerCache).delete()
@@ -68,7 +68,24 @@ class LocationRegistry:
             session.commit()
         finally:
             session.close()
+
+    def sync_markers(self) -> list[dict[str, Any]]:
+        envelope = self.client.query_markers()
+        markers = normalize_marker_response(envelope)
+        self._store_markers(markers)
         return markers
+
+    def load_marker_map(self, markers: dict[str, Any]) -> list[dict[str, Any]]:
+        """Replace the marker cache from an in-memory map (query_list shape).
+
+        Used when switching robot profiles so the agent resolves against the
+        chosen map regardless of what (if anything) the robot reports.
+        """
+        envelope = WaterEnvelope(command="/api/markers/query_list", status="OK", results=copy.deepcopy(markers))
+        markers_norm = normalize_marker_response(envelope)
+        self._store_markers(markers_norm)
+        self._ensure_default_aliases()
+        return markers_norm
 
     def list_locations(self) -> dict[str, Any]:
         session = self.session_factory()
