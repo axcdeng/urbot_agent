@@ -1,12 +1,37 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
 
 from app.config import Settings
 from app.water.schemas import WaterClientError
+
+
+# Reasoning models such as Qwen3 emit <think>...</think> blocks and frequently
+# wrap structured output in ```json ... ``` fences. The local mlx_lm.server does
+# not strip these, so we normalize the assistant content before parsing JSON.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def extract_json_object(content: str) -> dict[str, Any]:
+    """Best-effort extraction of a single JSON object from model output.
+
+    Tolerates leading whitespace, <think> reasoning blocks, and markdown code
+    fences by isolating the substring between the first '{' and last '}'.
+    """
+    cleaned = _THINK_RE.sub("", content or "")
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise WaterClientError("Planner response contained no JSON object.")
+    snippet = cleaned[start : end + 1]
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError as exc:
+        raise WaterClientError("Planner returned invalid JSON.") from exc
 
 
 class LLMClient:
@@ -26,10 +51,11 @@ class LLMClient:
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
+            "max_tokens": self.settings.llm_max_tokens,
         }
         url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
         try:
-            response = httpx.post(url, headers=self._headers(), json=payload, timeout=30.0)
+            response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
             response.raise_for_status()
             return response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -43,16 +69,14 @@ class LLMClient:
         payload = {
             "model": self.settings.llm_model,
             "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.settings.llm_max_tokens,
         }
         url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
         try:
-            response = httpx.post(url, headers=self._headers(), json=payload, timeout=30.0)
+            response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
             response.raise_for_status()
             data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise WaterClientError(f"Fallback planning request failed: {exc}") from exc
         content = data["choices"][0]["message"].get("content", "{}")
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise WaterClientError("Fallback planner returned invalid JSON.") from exc
+        return extract_json_object(content)

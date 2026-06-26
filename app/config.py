@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    water_robot_host: str = "192.168.10.10"
+    water_robot_host: str = "10.1.17.225"
     water_http_port: int = 9001
     water_tcp_port: int = 31001
     water_timeout_seconds: float = 10.0
@@ -22,9 +22,11 @@ class Settings(BaseSettings):
 
     llm_base_url: str = "http://localhost:8080/v1"
     llm_api_key: str = "local-llama"
-    llm_model: str = "qwen"
+    llm_model: str = "mlx-community/Qwen3-32B-4bit"
     llm_enabled: bool = True
     llm_dry_run: bool = False
+    llm_timeout_seconds: float = 120.0
+    llm_max_tokens: int = 1024
 
     mission_poll_seconds: float = 2.0
     mission_max_replans: int = 2
