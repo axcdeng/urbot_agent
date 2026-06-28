@@ -22,6 +22,7 @@ action available (soft e-stop + cancel).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,8 @@ from typing import Any
 from app.config import get_settings
 from app.main import ServiceContainer, build_services
 from app.robot.profiles import ROBOT_PROFILES
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +123,11 @@ class AgentConsole:
         return len(loaded)
 
     def chat(self, message: str) -> dict[str, Any]:
-        return self.services.agent_planner.run_chat(message)
+        llm = self.services.llm_client
+        llm.reset_metrics()
+        result = self.services.agent_planner.run_chat(message)
+        result["metrics"] = llm.metrics
+        return result
 
     def soft_estop(self) -> dict[str, Any]:
         return self.services.task_manager.emergency_stop()
@@ -218,6 +225,12 @@ class AgentConsole:
         return CommandResult([f"unknown command: /{cmd} (try /help)"])
 
 
+def _format_args(args: Any) -> str:
+    if isinstance(args, dict):
+        return ", ".join(f"{k}={v!r}" for k, v in args.items())
+    return str(args)
+
+
 def _format_status(state: dict[str, Any]) -> str:
     estop = "[red]ESTOP[/red]" if state.get("estop_state") else "ok"
     online = "online" if state.get("online") else "[red]offline[/red]"
@@ -248,6 +261,7 @@ if _TEXTUAL_AVAILABLE:
     class AlexAgentTUI(App):
         CSS = """
         #log { height: 1fr; border: round $primary; padding: 0 1; }
+        #thinking { height: 1; color: $warning; padding: 0 1; }
         #status { height: 1; background: $panel; color: $text; padding: 0 1; }
         #prompt { dock: bottom; }
         """
@@ -264,6 +278,9 @@ if _TEXTUAL_AVAILABLE:
             self.ctl = console
             self._last_esc = 0.0
             self._busy = False
+            self._spin = 0
+            self._think_start = 0.0
+            self._thinking_shown = False
             self._stop = threading.Event()
 
         # ----- layout ----------------------------------------------------- #
@@ -271,6 +288,7 @@ if _TEXTUAL_AVAILABLE:
             yield Header(show_clock=True)
             with Vertical():
                 yield RichLog(id="log", markup=True, wrap=True, highlight=False)
+                yield Static("", id="thinking")
                 yield Static("", id="status")
                 yield Input(placeholder="Message the agent, or /help …", id="prompt")
             yield Footer()
@@ -279,12 +297,14 @@ if _TEXTUAL_AVAILABLE:
             self.title = "alex_agent"
             self.log_widget = self.query_one("#log", RichLog)
             self.status_widget = self.query_one("#status", Static)
+            self.thinking_widget = self.query_one("#thinking", Static)
             self._write("[dim]Connected. Type a message or /help. Esc = soft e-stop.[/dim]")
             mode = "ON (simulated)" if self.ctl.dry_run else f"OFF — LIVE -> {self.ctl.live_target}"
             self._write(f"[dim]dry-run is {mode}[/dim]")
             self.query_one("#prompt", Input).focus()
             self._background_loop()
             self.set_interval(2.0, self._refresh)
+            self.set_interval(0.1, self._animate_thinking)
 
         # ----- input ------------------------------------------------------ #
         def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -306,6 +326,7 @@ if _TEXTUAL_AVAILABLE:
                 return
             self._write(f"[b cyan]you[/b cyan] {text}")
             self._busy = True
+            self._think_start = time.monotonic()
             self._chat_worker(text)
 
         # ----- e-stop ----------------------------------------------------- #
@@ -364,13 +385,23 @@ if _TEXTUAL_AVAILABLE:
             except Exception as exc:  # noqa: BLE001
                 state = {"online": False, "move_status": f"err: {exc}"}
             mode = "[green]DRY[/green]" if self.ctl.dry_run else "[red]LIVE[/red]"
-            busy = " · [yellow]working…[/yellow]" if self._busy else ""
             profile = self.ctl.current_profile()
             addr = f"{self.ctl.robot_addr}" + (f" ({profile})" if profile else "")
             self.call_from_thread(
                 self.status_widget.update,
-                f"{mode} {addr} · {_format_status(state)}{busy}",
+                f"{mode} {addr} · {_format_status(state)}",
             )
+
+        def _animate_thinking(self) -> None:
+            if self._busy:
+                frame = SPINNER[self._spin % len(SPINNER)]
+                self._spin += 1
+                elapsed = time.monotonic() - self._think_start
+                self.thinking_widget.update(f"{frame} Thinking… ({elapsed:.0f}s)  [dim]· Esc to e-stop[/dim]")
+                self._thinking_shown = True
+            elif self._thinking_shown:
+                self.thinking_widget.update("")
+                self._thinking_shown = False
 
         # ----- rendering helpers ------------------------------------------ #
         def _write(self, renderable: Any) -> None:
@@ -378,21 +409,51 @@ if _TEXTUAL_AVAILABLE:
 
         def _set_idle(self) -> None:
             self._busy = False
+            self.thinking_widget.update("")
+            self._thinking_shown = False
 
         def _render_result(self, result: dict[str, Any]) -> None:
             for call in result.get("tool_calls", []):
                 name = call.get("name")
                 args = call.get("arguments")
-                self._write(f"  [magenta]⚙ {name}[/magenta] {args}")
+                arg_str = _format_args(args)
+                self._write(f"  [magenta]🔧 {name}[/magenta]([cyan]{arg_str}[/cyan])")
                 payload = call.get("payload") or {}
-                summary = payload.get("status") or payload.get("error_message")
-                if summary:
-                    self._write(f"    [dim]-> {summary}[/dim]")
+                outcome = payload.get("error_message") or payload.get("status")
+                target = payload.get("requested_target") or payload.get("marker_name")
+                task_id = payload.get("task_id")
+                detail = " · ".join(
+                    p for p in (
+                        f"target={target}" if target else "",
+                        f"task={task_id[:8]}" if task_id else "",
+                        str(outcome) if outcome else "",
+                    ) if p
+                )
+                if detail:
+                    self._write(f"     [dim]→ {detail}[/dim]")
             for mission_id in result.get("created_mission_ids", []):
-                self._write(f"  [blue]＋ mission {mission_id}[/blue]")
-            for task_id in result.get("created_task_ids", []):
-                self._write(f"  [blue]＋ task {task_id}[/blue]")
+                self._write(f"  [blue]＋ mission {mission_id[:8]}[/blue]")
             self._write(f"[b green]agent[/b green] {result.get('assistant_response', '')}")
+            metrics = result.get("metrics")
+            if metrics is not None and getattr(metrics, "calls", 0):
+                self._write(
+                    f"[dim]↑{metrics.prompt_tokens} in · ↓{metrics.completion_tokens} out · "
+                    f"{metrics.tps:.0f} tok/s · {metrics.elapsed_s:.1f}s · {metrics.calls} call(s)[/dim]"
+                )
+
+
+def _configure_logging() -> None:
+    # Textual owns the terminal; library/app logging to the console corrupts the
+    # UI. Route everything to a file and quiet the chatty HTTP loggers.
+    logging.basicConfig(
+        filename="alexagent.log",
+        filemode="a",
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -400,6 +461,7 @@ def main() -> None:
         raise SystemExit(
             "The TUI requires the 'textual' package. Install it with: pip install -e ."
         )
+    _configure_logging()
     services = build_services(get_settings())
     AlexAgentTUI(AgentConsole(services)).run()
 

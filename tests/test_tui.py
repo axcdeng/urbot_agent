@@ -102,3 +102,6 @@ def test_chat_returns_structured_result_when_llm_disabled(tmp_path: Path):
     result = console.chat("hello there")
     assert "assistant_response" in result
     assert "tool_calls" in result
+    # metrics are attached for the turn (zero calls when the LLM is disabled)
+    assert "metrics" in result
+    assert result["metrics"].calls == 0

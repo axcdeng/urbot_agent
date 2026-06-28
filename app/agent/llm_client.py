@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -34,9 +36,40 @@ def extract_json_object(content: str) -> dict[str, Any]:
         raise WaterClientError("Planner returned invalid JSON.") from exc
 
 
+@dataclass
+class LLMMetrics:
+    """Accumulated LLM usage for one chat turn (may span several calls)."""
+
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    elapsed_s: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def tps(self) -> float:
+        # End-to-end generation rate: output tokens over wall-clock spent in
+        # the model calls (includes prompt processing, so a conservative TPS).
+        return self.completion_tokens / self.elapsed_s if self.elapsed_s > 0 else 0.0
+
+
 class LLMClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.metrics = LLMMetrics()
+
+    def reset_metrics(self) -> None:
+        self.metrics = LLMMetrics()
+
+    def _record(self, data: dict[str, Any], elapsed: float) -> None:
+        usage = (data or {}).get("usage") or {}
+        self.metrics.calls += 1
+        self.metrics.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.metrics.completion_tokens += int(usage.get("completion_tokens") or 0)
+        self.metrics.elapsed_s += elapsed
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.settings.llm_api_key}"}
@@ -55,11 +88,14 @@ class LLMClient:
         }
         url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
         try:
+            t0 = time.perf_counter()
             response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise WaterClientError(f"Tool-calling request failed: {exc}") from exc
+        self._record(data, time.perf_counter() - t0)
+        return data
 
     def json_plan(self, prompt: str) -> dict[str, Any]:
         if not self.settings.llm_enabled:
@@ -73,10 +109,12 @@ class LLMClient:
         }
         url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
         try:
+            t0 = time.perf_counter()
             response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
             response.raise_for_status()
             data = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise WaterClientError(f"Fallback planning request failed: {exc}") from exc
+        self._record(data, time.perf_counter() - t0)
         content = data["choices"][0]["message"].get("content", "{}")
         return extract_json_object(content)
