@@ -272,8 +272,12 @@ if _TEXTUAL_AVAILABLE:
             Binding("escape", "estop", "E-STOP", priority=True, show=True),
             Binding("ctrl+c", "quit", "Quit", priority=True, show=True),
             # Scroll the transcript (works even when the input has focus).
-            Binding("pageup", "scroll_chat('pageup')", "Scroll up", show=True),
-            Binding("pagedown", "scroll_chat('pagedown')", "Scroll down", show=True),
+            # Plain up/down matters for Terminal.app, whose "Scroll alternate
+            # screen" turns the trackpad/wheel into arrow-key input to the app.
+            Binding("up", "scroll_chat('up')", "Scroll up", show=True),
+            Binding("down", "scroll_chat('down')", "Scroll down", show=True),
+            Binding("pageup", "scroll_chat('pageup')", "Page up", show=False),
+            Binding("pagedown", "scroll_chat('pagedown')", "Page down", show=False),
             Binding("shift+up", "scroll_chat('up')", "Line up", show=False),
             Binding("shift+down", "scroll_chat('down')", "Line down", show=False),
         ]
