@@ -105,3 +105,12 @@ def test_chat_returns_structured_result_when_llm_disabled(tmp_path: Path):
     # metrics are attached for the turn (zero calls when the LLM is disabled)
     assert "metrics" in result
     assert result["metrics"].calls == 0
+
+
+def test_chat_with_then_but_no_movement_does_not_crash(tmp_path: Path):
+    # "and then" trips the mission heuristic, but there is no movement step;
+    # this must answer normally, not raise "A mission requires at least one step."
+    console = build_console(tmp_path)
+    result = console.chat("Hey, what's your battery and then list all the locations you can go to")
+    assert "assistant_response" in result
+    assert not result.get("created_mission_ids")

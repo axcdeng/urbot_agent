@@ -51,22 +51,27 @@ class AgentPlanner:
         }
 
     def run_chat(self, message: str) -> dict[str, Any]:
+        # The sequence heuristic ("... then ...") over-triggers on ordinary
+        # questions like "what's your battery and then list locations". Only
+        # create a mission when planning actually produced steps; otherwise fall
+        # through to the normal tool-answering path.
         if self.mission_planner.should_plan_mission(message):
             planned = self.mission_planner.plan_steps_from_text(message)
-            mission = self.mission_manager.create_mission(
-                user_request=message,
-                steps=planned["steps"],
-                name=planned.get("mission_name"),
-                auto_replan=True,
-            )
-            return {
-                "assistant_response": planned.get("response", "Created a mission."),
-                "tool_calls": [],
-                "created_task_ids": [],
-                "created_mission_ids": [mission["mission_id"]],
-                "final_robot_state": self.state_manager.get_compact_robot_state(),
-                "mission": mission,
-            }
+            if planned.get("steps"):
+                mission = self.mission_manager.create_mission(
+                    user_request=message,
+                    steps=planned["steps"],
+                    name=planned.get("mission_name"),
+                    auto_replan=True,
+                )
+                return {
+                    "assistant_response": planned.get("response", "Created a mission."),
+                    "tool_calls": [],
+                    "created_task_ids": [],
+                    "created_mission_ids": [mission["mission_id"]],
+                    "final_robot_state": self.state_manager.get_compact_robot_state(),
+                    "mission": mission,
+                }
 
         tool_calls_used: list[dict[str, Any]] = []
         created_task_ids: list[str] = []
