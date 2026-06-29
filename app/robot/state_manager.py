@@ -10,6 +10,23 @@ from app.water.schemas import WaterClientError
 class StateManager:
     def __init__(self, client: WaterRobotClient):
         self.client = client
+        self._device_identity: dict[str, Any] | None = None
+
+    def get_device_identity(self, refresh: bool = False) -> dict[str, Any] | None:
+        """This robot's own {chassis_key, cabin_key, sn}, best-effort.
+
+        The device-info service (separate port) may be unavailable; in that case
+        the last known identity is returned (chassis_key is stable), or None if
+        never fetched. Pass refresh=True to re-read (e.g. once per chat turn) so
+        a newly-attached/removed cabin is picked up.
+        """
+        if self._device_identity is not None and not refresh:
+            return self._device_identity
+        try:
+            self._device_identity = self.client.get_device_identity()
+        except WaterClientError:
+            pass  # keep last known identity
+        return self._device_identity
 
     def _optional_call(self, fn):
         """Best-effort supplementary call; returns None if the endpoint fails.

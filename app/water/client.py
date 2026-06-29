@@ -35,6 +35,8 @@ DRY_MARKERS = {
             "position": {"x": 4.11, "y": -9.06, "z": 0.0},
             "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.006},
         },
+        # Charges a cabin (sweep module) only — no chassis.
+        "properties": '{"cabin_key":"SCQS00G13C0100349","charging_pile_type":"sweep_charging_pile"}',
     },
     "toReception": {
         "marker_name": "toReception",
@@ -143,6 +145,8 @@ DRY_MARKERS = {
             "position": {"x": 4.43, "y": -6.91, "z": 0.0},
             "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.009},
         },
+        # A DIFFERENT robot's chassis charger (foreign).
+        "properties": '{"charging_pile_type":"up_charging_pile","chassis_key":"WTHT08E0390415704"}',
     },
     "charge_point_1F_40300423": {
         "marker_name": "charge_point_1F_40300423",
@@ -152,6 +156,8 @@ DRY_MARKERS = {
             "position": {"x": 4.25, "y": -8.19, "z": 0.0},
             "orientation": {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.03},
         },
+        # This robot's own charger: charges this chassis (and a cabin).
+        "properties": '{"cabin_key":"SCSK08C03B0800199","charging_pile_type":"up_charging_pile","chassis_key":"WTHT08E03B0616789"}',
     },
     "Kitchen": {
         "marker_name": "Kitchen",
@@ -171,6 +177,17 @@ DRY_MARKERS = {
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.72, "w": -0.69},
         },
     },
+}
+
+
+# Dry-run identity for /api/tools/device/info. chassis_key matches the dry
+# "charge_point_1F_40300423" (this robot's own chassis charger) and cabin_key
+# matches "charge_point_1F_1" (a cabin charger), so resolution can be exercised
+# offline. relevanceKey (cabin) is dynamic on real units and may be null.
+DRY_DEVICE_IDENTITY = {
+    "chassis_key": "WTHT08E03B0616789",
+    "cabin_key": "SCQS00G13C0100349",
+    "sn": "1afef5ffb1dc4092919f624561c721e9",
 }
 
 
@@ -443,3 +460,30 @@ class WaterRobotClient:
 
     def request_realtime_data(self, topic: str, frequency: float = 1.0) -> dict[str, Any]:
         return self.tcp_transport.subscribe(topic, frequency)
+
+    def get_device_identity(self) -> dict[str, Any]:
+        """Return this robot's own identity from the device-info service.
+
+        Shape: {"chassis_key", "cabin_key", "sn"}. chassis_key is the robot's
+        physical base (stable); cabin_key is the currently-attached top module
+        and may be None. Raises WaterClientError on any transport/parse failure.
+        """
+        if self.dry_run:
+            return dict(DRY_DEVICE_IDENTITY)
+        url = f"{self.settings.device_info_base_url}/api/tools/device/info"
+        try:
+            response = httpx.get(url, timeout=self.settings.water_timeout_seconds)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.TimeoutException as exc:
+            raise WaterClientError("Timed out calling device/info") from exc
+        except httpx.HTTPError as exc:
+            raise WaterClientError(f"HTTP error calling device/info: {exc}") from exc
+        except ValueError as exc:
+            raise WaterClientError("Non-JSON response from device/info") from exc
+        info = ((payload or {}).get("data") or {}).get("info") or {}
+        return {
+            "chassis_key": info.get("key"),
+            "cabin_key": info.get("relevanceKey"),
+            "sn": info.get("sn"),
+        }

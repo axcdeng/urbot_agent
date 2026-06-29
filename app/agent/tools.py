@@ -58,12 +58,21 @@ class AgentToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "move_to_location",
-                    "description": "Move the robot to ONE known marker or alias by name. Use this for a single destination.",
+                    "description": (
+                        "Move the robot to ONE known marker or alias by name. Use this for a single "
+                        "destination. If the destination is a charging dock that does not serve this "
+                        "robot, the move is blocked and asks for confirmation; only then re-call with "
+                        "confirm=true after the user explicitly agrees."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "location_name": {"type": "string"},
                             "allow_interruption": {"type": "boolean"},
+                            "confirm": {
+                                "type": "boolean",
+                                "description": "Set true ONLY after the user confirms moving to a charger that is not this robot's own.",
+                            },
                         },
                         "required": ["location_name"],
                         "additionalProperties": False,
@@ -178,6 +187,7 @@ class AgentToolRegistry:
             task = self.task_manager.create_move_marker_task(
                 arguments["location_name"],
                 allow_interruption=bool(arguments.get("allow_interruption", False)),
+                confirm_foreign_charger=bool(arguments.get("confirm", False)),
             )
             return ToolExecution(content=f"Created move task {task['task_id']}.", task_ids=[task["task_id"]], payload=task)
         if name == "create_mission":

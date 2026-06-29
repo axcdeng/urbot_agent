@@ -138,6 +138,7 @@ class TaskManager:
         allow_interruption: bool = False,
         mission_id: str | None = None,
         mission_step_id: str | None = None,
+        confirm_foreign_charger: bool = False,
     ) -> dict[str, Any]:
         session = self.session_factory()
         try:
@@ -151,6 +152,23 @@ class TaskManager:
                 mission_id=mission_id,
                 mission_step_id=mission_step_id,
             )
+            # Guard: a charging dock that serves a different chassis/cabin is not
+            # this robot's. Require explicit confirmation before driving there.
+            if not confirm_foreign_charger:
+                identity = self.state_manager.get_device_identity()
+                charger = self.location_registry.classify_marker(resolved.marker_name or marker_name, identity)
+                if charger is not None and not charger["is_mine"]:
+                    own = self.location_registry.resolve_own_charger(identity)
+                    own_hint = f" This robot's own charger is '{own}'." if own else ""
+                    self._raise_validation(
+                        session,
+                        record,
+                        f"'{charger['marker_name']}' is a charging dock that does not serve this robot "
+                        f"(its cabin_key={charger.get('cabin_key')}, chassis_key={charger.get('chassis_key')}; "
+                        f"this robot's chassis_key={identity.get('chassis_key') if identity else None}, "
+                        f"cabin_key={identity.get('cabin_key') if identity else None})."
+                        f"{own_hint} Confirm with the user before moving to another robot's charger.",
+                    )
             state = self.state_manager.get_robot_state()
             decision = self.safety.validate_move(
                 state,
@@ -226,7 +244,17 @@ class TaskManager:
             session.close()
 
     def return_to_charger(self, mission_id: str | None = None, mission_step_id: str | None = None) -> dict[str, Any]:
-        return self.create_move_marker_task("charger", mission_id=mission_id, mission_step_id=mission_step_id)
+        # Target this robot's OWN charger (resolved from its chassis/cabin keys),
+        # not a static alias — the map can hold several chargers for different
+        # robots. Fall back to the "charger" alias only if identity is unknown.
+        identity = self.state_manager.get_device_identity()
+        target = self.location_registry.resolve_own_charger(identity) or "charger"
+        return self.create_move_marker_task(
+            target,
+            mission_id=mission_id,
+            mission_step_id=mission_step_id,
+            confirm_foreign_charger=True,
+        )
 
     def emergency_stop(self, mission_id: str | None = None, mission_step_id: str | None = None) -> dict[str, Any]:
         session = self.session_factory()

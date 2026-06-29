@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     water_robot_host: str = "10.1.17.225"
     water_http_port: int = 9001
     water_tcp_port: int = 31001
+    # The device/cabin management service ("up_tools") runs on a separate port
+    # from the navigation API and exposes /api/tools/device/info, which reports
+    # this robot's own chassis key and currently-attached cabin key.
+    water_device_info_port: int = 19001
     water_timeout_seconds: float = 10.0
     water_dry_run: bool = True
     min_move_battery_percent: int = 20
@@ -39,6 +43,10 @@ class Settings(BaseSettings):
     @property
     def http_base_url(self) -> str:
         return f"http://{self.water_robot_host}:{self.water_http_port}"
+
+    @property
+    def device_info_base_url(self) -> str:
+        return f"http://{self.water_robot_host}:{self.water_device_info_port}"
 
 
 @lru_cache(maxsize=1)

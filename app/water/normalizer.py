@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from math import atan2
 from typing import Any
 
 from app.water.schemas import WaterEnvelope
+
+
+def parse_marker_properties(raw_properties: Any) -> dict[str, Any]:
+    """Parse a marker's `properties` field (a JSON string on real units).
+
+    Charger markers (key 11) carry e.g.
+    {"cabin_key": "...", "chassis_key": "...", "charging_pile_type": "..."}.
+    Returns {} when absent or unparseable.
+    """
+    if isinstance(raw_properties, dict):
+        return raw_properties
+    if isinstance(raw_properties, str) and raw_properties.strip():
+        try:
+            parsed = json.loads(raw_properties)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def utc_timestamp() -> str:
@@ -61,6 +80,7 @@ def normalize_marker_response(envelope: WaterEnvelope) -> list[dict[str, Any]]:
         pose = payload.get("pose") or {}
         position = pose.get("position") or {}
         orientation = pose.get("orientation") or {}
+        properties = parse_marker_properties(payload.get("properties"))
         markers.append(
             {
                 "marker_name": marker_name,
@@ -72,6 +92,9 @@ def normalize_marker_response(envelope: WaterEnvelope) -> list[dict[str, Any]]:
                     "z": position.get("z"),
                     "theta": quaternion_to_theta(orientation),
                 },
+                "cabin_key": properties.get("cabin_key"),
+                "chassis_key": properties.get("chassis_key"),
+                "charging_pile_type": properties.get("charging_pile_type"),
                 "raw_payload": payload,
             }
         )

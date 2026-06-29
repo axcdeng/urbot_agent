@@ -70,9 +70,11 @@ class AgentPlanner:
         state_summary = self.state_manager.get_compact_robot_state()
         locations = self._compact_locations()
         missions = self._compact_missions()
+        identity = self.state_manager.get_device_identity(refresh=True)
+        chargers = self.location_registry.list_chargers(identity)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt()},
-            {"role": "system", "content": build_runtime_context(state_summary, locations, missions)},
+            {"role": "system", "content": build_runtime_context(state_summary, locations, missions, identity, chargers)},
             {"role": "user", "content": message},
         ]
 
@@ -175,7 +177,9 @@ class AgentPlanner:
         state = self.state_manager.get_compact_robot_state()
         locations = self._compact_locations()
         missions = self._compact_missions()
-        prompt = build_json_fallback_prompt(message, state, locations, missions)
+        identity = self.state_manager.get_device_identity()
+        chargers = self.location_registry.list_chargers(identity)
+        prompt = build_json_fallback_prompt(message, state, locations, missions, identity, chargers)
         try:
             plan = self.llm_client.json_plan(prompt)
         except WaterClientError:

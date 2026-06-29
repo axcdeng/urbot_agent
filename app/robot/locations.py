@@ -9,8 +9,12 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import LocationAlias, MarkerCache
 from app.water.client import WaterRobotClient
-from app.water.normalizer import normalize_marker_response
+from app.water.normalizer import normalize_marker_response, parse_marker_properties
 from app.water.schemas import WaterEnvelope
+
+
+# WATER marker `key` (point type) for a charging dock.
+CHARGER_MARKER_TYPE = 11
 
 
 # Friendly names mapped to canonical marker names on the deployed 1F map.
@@ -32,6 +36,29 @@ class ResolvedLocation:
     requested_name: str
     marker_name: str | None
     source: str
+
+
+def _charger_keys(raw_payload: dict[str, Any] | None) -> dict[str, Any]:
+    props = parse_marker_properties((raw_payload or {}).get("properties"))
+    return {
+        "cabin_key": props.get("cabin_key"),
+        "chassis_key": props.get("chassis_key"),
+        "charging_pile_type": props.get("charging_pile_type"),
+    }
+
+
+def _charger_match(keys: dict[str, Any], identity: dict[str, Any] | None) -> dict[str, bool]:
+    """Does a charger (its parsed keys) serve THIS robot (its identity)?"""
+    identity = identity or {}
+    my_chassis = identity.get("chassis_key")
+    my_cabin = identity.get("cabin_key")
+    charges_my_chassis = bool(my_chassis and keys.get("chassis_key") == my_chassis)
+    charges_my_cabin = bool(my_cabin and keys.get("cabin_key") == my_cabin)
+    return {
+        "charges_my_chassis": charges_my_chassis,
+        "charges_my_cabin": charges_my_cabin,
+        "is_mine": charges_my_chassis or charges_my_cabin,
+    }
 
 
 class LocationRegistry:
@@ -99,11 +126,71 @@ class LocationRegistry:
                         "floor": marker.floor,
                         "marker_type": marker.marker_type,
                         "pose": marker.pose,
+                        **(
+                            _charger_keys(marker.raw_payload)
+                            if marker.marker_type == CHARGER_MARKER_TYPE
+                            else {}
+                        ),
                     }
                     for marker in markers
                 ],
                 "aliases": [{"alias": alias.alias, "marker_name": alias.marker_name} for alias in aliases],
             }
+        finally:
+            session.close()
+
+    def list_chargers(self, identity: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """All charging-dock markers with their keys and how they relate to this robot."""
+        session = self.session_factory()
+        try:
+            rows = session.scalars(
+                select(MarkerCache)
+                .where(MarkerCache.marker_type == CHARGER_MARKER_TYPE)
+                .order_by(MarkerCache.marker_name)
+            ).all()
+            chargers = []
+            for marker in rows:
+                keys = _charger_keys(marker.raw_payload)
+                chargers.append(
+                    {
+                        "marker_name": marker.marker_name,
+                        "floor": marker.floor,
+                        **keys,
+                        **_charger_match(keys, identity),
+                    }
+                )
+            return chargers
+        finally:
+            session.close()
+
+    def resolve_own_charger(self, identity: dict[str, Any] | None) -> str | None:
+        """The marker name of this robot's own charger.
+
+        Prefers a charger that charges this robot's chassis (the base needs to
+        dock to recharge); falls back to one that charges its attached cabin.
+        Returns None if identity is unknown or no charger matches.
+        """
+        chargers = self.list_chargers(identity)
+        for charger in chargers:
+            if charger["charges_my_chassis"]:
+                return charger["marker_name"]
+        for charger in chargers:
+            if charger["charges_my_cabin"]:
+                return charger["marker_name"]
+        return None
+
+    def classify_marker(self, marker_name: str, identity: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Charger classification for a resolved marker, or None if it isn't a charger."""
+        session = self.session_factory()
+        try:
+            canonical = self._canonical_marker_name(session, marker_name)
+            if canonical is None:
+                return None
+            marker = session.get(MarkerCache, canonical)
+            if marker is None or marker.marker_type != CHARGER_MARKER_TYPE:
+                return None
+            keys = _charger_keys(marker.raw_payload)
+            return {"marker_name": canonical, **keys, **_charger_match(keys, identity)}
         finally:
             session.close()
 
