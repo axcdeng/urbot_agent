@@ -60,6 +60,8 @@ HELP_LINES = [
     "[b]Keys[/b]",
     "  Esc                soft e-stop (immediate)",
     "  Esc Esc            PANIC: soft e-stop + cancel active move",
+    "  PgUp / PgDn        scroll the transcript",
+    "  Shift+↑ / Shift+↓  scroll the transcript one line",
     "",
     "Anything not starting with '/' is sent to the AI agent.",
 ]
@@ -269,6 +271,11 @@ if _TEXTUAL_AVAILABLE:
         BINDINGS = [
             Binding("escape", "estop", "E-STOP", priority=True, show=True),
             Binding("ctrl+c", "quit", "Quit", priority=True, show=True),
+            # Scroll the transcript (works even when the input has focus).
+            Binding("pageup", "scroll_chat('pageup')", "Scroll up", show=True),
+            Binding("pagedown", "scroll_chat('pagedown')", "Scroll down", show=True),
+            Binding("shift+up", "scroll_chat('up')", "Line up", show=False),
+            Binding("shift+down", "scroll_chat('down')", "Line down", show=False),
         ]
 
         DOUBLE_ESC_WINDOW = 0.45  # seconds
@@ -328,6 +335,18 @@ if _TEXTUAL_AVAILABLE:
             self._busy = True
             self._think_start = time.monotonic()
             self._chat_worker(text)
+
+        # ----- scrolling --------------------------------------------------- #
+        def action_scroll_chat(self, how: str) -> None:
+            log = self.log_widget
+            if how == "pageup":
+                log.scroll_page_up()
+            elif how == "pagedown":
+                log.scroll_page_down()
+            elif how == "up":
+                log.scroll_up()
+            elif how == "down":
+                log.scroll_down()
 
         # ----- e-stop ----------------------------------------------------- #
         def action_estop(self) -> None:

@@ -57,6 +57,13 @@ happens until you run `/dryrun off`.
 | `Esc` `Esc` (within ~0.45s) | **PANIC**: soft e-stop **+ cancel** the active move |
 | `Ctrl+C` | Quit |
 | `Enter` | Send the message / run the command |
+| `PgUp` / `PgDn` | Scroll the transcript up / down a page |
+| `Shift+↑` / `Shift+↓` | Scroll the transcript one line |
+
+The transcript scrolls **within the panel** (it does not scroll the terminal's
+own scrollback). New replies jump back to the latest message. If your terminal
+forwards the mouse wheel to the app it will scroll the transcript too, but the
+keys above always work regardless of terminal/mouse settings.
 
 E-stop runs on a worker thread, so it fires **instantly even while the model is
 still generating** — the in-flight reply can't beat it to the robot. Note: a
