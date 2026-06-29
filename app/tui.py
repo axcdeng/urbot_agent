@@ -344,7 +344,7 @@ try:  # Import lazily so `import app.tui` doesn't hard-require textual for tests
     from textual import work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Vertical
+    from textual.containers import Horizontal, Vertical
     from textual.widgets import Footer, Header, Input, RichLog, Static
 
     _TEXTUAL_AVAILABLE = True
@@ -360,6 +360,10 @@ if _TEXTUAL_AVAILABLE:
         #thinking { height: 1; color: $warning; padding: 0 1; }
         #status { height: 1; background: $panel; color: $text; padding: 0 1; }
         #prompt { dock: bottom; }
+        /* Footer + a right-aligned context gauge share the bottom line. */
+        #footerbar { dock: bottom; height: 1; }
+        #footerbar Footer { dock: none; width: 1fr; height: 1; }
+        #ctx { width: auto; height: 1; padding: 0 1; background: $panel; color: $text-muted; content-align: right middle; }
         """
 
         BINDINGS = [
@@ -396,13 +400,16 @@ if _TEXTUAL_AVAILABLE:
                 yield Static("", id="thinking")
                 yield Static("", id="status")
                 yield Input(placeholder="Message the agent, or /help …", id="prompt")
-            yield Footer()
+            with Horizontal(id="footerbar"):
+                yield Footer()
+                yield Static("", id="ctx")
 
         def on_mount(self) -> None:
             self.title = "alex_agent"
             self.log_widget = self.query_one("#log", RichLog)
             self.status_widget = self.query_one("#status", Static)
             self.thinking_widget = self.query_one("#thinking", Static)
+            self.ctx_widget = self.query_one("#ctx", Static)
             self._write("[dim]Connected. Type a message or /help. Esc = soft e-stop.[/dim]")
             mode = "ON (simulated)" if self.ctl.dry_run else f"OFF — LIVE -> {self.ctl.live_target}"
             self._write(f"[dim]dry-run is {mode}[/dim]")
@@ -546,12 +553,13 @@ if _TEXTUAL_AVAILABLE:
             except Exception:  # noqa: BLE001
                 pct = 0
             threshold = int(self.ctl.services.settings.auto_compact_threshold * 100)
-            ctx = f"[yellow]ctx {pct}%[/yellow]" if pct >= threshold else f"ctx {pct}%"
+            ctx = f"[yellow]ctx {pct}%[/yellow]" if pct >= threshold else f"[dim]ctx {pct}%[/dim]"
             title = self.ctl.chat_title() or "new chat"
             self.call_from_thread(
                 self.status_widget.update,
-                f"{mode} {addr} · {_format_status(state)} · {ctx}",
+                f"{mode} {addr} · {_format_status(state)}",
             )
+            self.call_from_thread(self.ctx_widget.update, ctx)
             self.call_from_thread(self._set_subtitle, title)
 
         def _set_subtitle(self, title: str) -> None:
