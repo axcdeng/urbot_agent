@@ -348,6 +348,18 @@ if _TEXTUAL_AVAILABLE:
             elif how == "down":
                 log.scroll_down()
 
+        # Mouse-wheel anywhere scrolls the transcript (terminals that forward the
+        # wheel to the app — the RichLog already handles it directly when hovered).
+        def on_mouse_scroll_down(self, event) -> None:
+            for _ in range(3):
+                self.log_widget.scroll_down(animate=False)
+            event.stop()
+
+        def on_mouse_scroll_up(self, event) -> None:
+            for _ in range(3):
+                self.log_widget.scroll_up(animate=False)
+            event.stop()
+
         # ----- e-stop ----------------------------------------------------- #
         def action_estop(self) -> None:
             now = time.monotonic()
