@@ -55,7 +55,7 @@ def build_services(settings: Settings) -> ServiceContainer:
     location_registry = LocationRegistry(session_factory, client)
     location_registry.sync_markers()
     safety = SafetyValidator(settings)
-    task_manager = TaskManager(session_factory, client, state_manager, location_registry, safety)
+    task_manager = TaskManager(session_factory, client, state_manager, location_registry, safety, poll_seconds=settings.task_poll_seconds)
     llm_client = LLMClient(settings)
     mission_planner = MissionPlanner(llm_client, location_registry, state_manager, settings)
     mission_manager = MissionManager(session_factory, task_manager, state_manager, location_registry, settings, mission_planner=mission_planner)

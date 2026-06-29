@@ -51,12 +51,14 @@ class TaskManager:
         state_manager: StateManager,
         location_registry: LocationRegistry,
         safety: SafetyValidator,
+        poll_seconds: float = 0.5,
     ):
         self.session_factory = session_factory
         self.client = client
         self.state_manager = state_manager
         self.location_registry = location_registry
         self.safety = safety
+        self.poll_seconds = poll_seconds
         self._polling_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
@@ -367,7 +369,7 @@ class TaskManager:
                 self.poll_active_tasks()
             except Exception as exc:  # pragma: no cover
                 self._log("error", "poll_error", "Task poll loop failed.", {"error": str(exc)})
-            await asyncio.sleep(2)
+            await asyncio.sleep(self.poll_seconds)
 
     async def stop_polling(self) -> None:
         if self._polling_task is None:

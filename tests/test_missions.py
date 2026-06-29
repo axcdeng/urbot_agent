@@ -61,6 +61,62 @@ def test_mission_runs_steps_sequentially(tmp_path: Path):
     assert [step["status"] for step in result["steps"]] == ["succeeded", "succeeded", "succeeded"]
 
 
+def test_poll_advances_multiple_steps_in_one_pass(tmp_path: Path):
+    """A single poll pass should drive all ready steps to completion.
+
+    Previously the poller advanced exactly one step transition per pass, so a
+    chain of instant steps (or a completed step's successor) waited a full poll
+    interval each. That stacked poll-interval latency between every step.
+    """
+    mission_manager, _, _ = build_mission_manager(tmp_path)
+    mission = mission_manager.create_mission(
+        user_request="Run three fast steps",
+        steps=[{"step_type": "cancel_move", "description": f"Cancel {idx}"} for idx in range(3)],
+        auto_replan=False,
+    )
+
+    mission_manager.poll_missions()
+
+    result = mission_manager.get_mission(mission["mission_id"])
+    assert result["status"] == "succeeded"
+    assert [step["status"] for step in result["steps"]] == ["succeeded", "succeeded", "succeeded"]
+
+
+def test_wait_completion_dispatches_next_step_in_same_pass(tmp_path: Path):
+    """When a wait's timer elapses, the same poll pass should also start the next step.
+
+    The wait timer itself is wall-clock correct; the bug was that completing the
+    wait and dispatching the following step happened in separate poll passes,
+    adding a poll interval of dead time after every wait.
+    """
+    import time
+
+    mission_manager, _, _ = build_mission_manager(tmp_path)
+    mission = mission_manager.create_mission(
+        user_request="Wait then cancel",
+        steps=[
+            {"step_type": "wait", "wait_seconds": 1},
+            {"step_type": "cancel_move"},
+        ],
+        auto_replan=False,
+    )
+
+    # First pass arms the wait (PENDING -> WAITING) and, since it has not
+    # elapsed, blocks there.
+    mission_manager.poll_missions()
+    assert mission_manager.get_mission(mission["mission_id"])["steps"][0]["status"] == "waiting"
+
+    time.sleep(1.1)
+
+    # A single pass after the timer elapses must complete the wait AND run the
+    # next step, finishing the mission.
+    mission_manager.poll_missions()
+
+    result = mission_manager.get_mission(mission["mission_id"])
+    assert result["status"] == "succeeded"
+    assert [step["status"] for step in result["steps"]] == ["succeeded", "succeeded"]
+
+
 def test_mission_replan_uses_compact_context(tmp_path: Path):
     mission_manager, task_manager, mission_planner = build_mission_manager(tmp_path)
     mission = mission_manager.create_mission(

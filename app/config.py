@@ -32,7 +32,13 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 120.0
     llm_max_tokens: int = 1024
 
-    mission_poll_seconds: float = 2.0
+    # Poll cadences. These bound how quickly a finished move is noticed and how
+    # accurately a wait fires; with the per-pass step advancing in MissionManager,
+    # the perceived gap between steps is roughly one of these intervals rather
+    # than several stacked. Kept moderate (sub-second but not aggressive) so the
+    # robot isn't hammered: each task poll makes ~3 HTTP calls to the robot.
+    mission_poll_seconds: float = 0.5
+    task_poll_seconds: float = 0.5
     mission_max_replans: int = 2
     agent_max_recent_events: int = 6
     agent_max_location_names: int = 40
