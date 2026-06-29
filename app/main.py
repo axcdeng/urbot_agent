@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from app.agent.conversation import ConversationManager
 from app.agent.llm_client import LLMClient
 from app.agent.mission_planner import MissionPlanner
 from app.agent.planner import AgentPlanner
@@ -45,6 +46,7 @@ class ServiceContainer:
     mission_planner: MissionPlanner
     agent_tools: AgentToolRegistry
     agent_planner: AgentPlanner
+    conversation_manager: ConversationManager
 
 
 def build_services(settings: Settings) -> ServiceContainer:
@@ -61,6 +63,7 @@ def build_services(settings: Settings) -> ServiceContainer:
     mission_manager = MissionManager(session_factory, task_manager, state_manager, location_registry, settings, mission_planner=mission_planner)
     agent_tools = AgentToolRegistry(state_manager, location_registry, task_manager, mission_manager, mission_planner)
     agent_planner = AgentPlanner(llm_client, agent_tools, state_manager, location_registry, mission_manager, mission_planner)
+    conversation_manager = ConversationManager(session_factory, llm_client, settings)
     return ServiceContainer(
         settings=settings,
         client=client,
@@ -73,6 +76,7 @@ def build_services(settings: Settings) -> ServiceContainer:
         mission_planner=mission_planner,
         agent_tools=agent_tools,
         agent_planner=agent_planner,
+        conversation_manager=conversation_manager,
     )
 
 

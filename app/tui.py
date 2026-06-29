@@ -22,6 +22,7 @@ action available (soft e-stop + cancel).
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -53,6 +54,10 @@ HELP_LINES = [
     "  /status            current robot state",
     "  /markers           known markers and aliases",
     "  /release           release the soft e-stop",
+    "  /new               start a new chat",
+    "  /chats             list previous chats",
+    "  /open <n>          re-open a chat from /chats",
+    "  /compact [note]    summarize earlier turns to free up context",
     "  /clear             clear the transcript",
     "  /help              this help",
     "  /quit              exit",
@@ -63,6 +68,7 @@ HELP_LINES = [
     "  PgUp / PgDn        scroll the transcript",
     "  Shift+↑ / Shift+↓  scroll the transcript one line",
     "",
+    "The agent remembers earlier messages in the current chat; /new starts fresh.",
     "Anything not starting with '/' is sent to the AI agent.",
 ]
 
@@ -76,6 +82,14 @@ class AgentConsole:
 
     def __init__(self, services: ServiceContainer):
         self.services = services
+        # Each TUI run starts in a fresh chat; previous chats are reachable via
+        # /chats + /open. (Not auto-resuming is deliberate — it's why a restart
+        # no longer drags an old conversation/mission back into context.)
+        self.current_session_id = services.conversation_manager.create_session()
+
+    @property
+    def convo(self):
+        return self.services.conversation_manager
 
     # ----- robot / agent actions ----------------------------------------- #
     @property
@@ -127,9 +141,66 @@ class AgentConsole:
     def chat(self, message: str) -> dict[str, Any]:
         llm = self.services.llm_client
         llm.reset_metrics()
-        result = self.services.agent_planner.run_chat(message)
-        result["metrics"] = llm.metrics
+        summary, history = self.convo.build_history(self.current_session_id)
+        result = self.services.agent_planner.run_chat(message, history=history, summary=summary)
+        # Snapshot the answer's metrics BEFORE the title/compaction calls below
+        # (they reuse the same LLM client and would otherwise inflate the numbers
+        # shown for this turn).
+        result["metrics"] = copy.copy(llm.metrics)
+        self.convo.record_turn(self.current_session_id, message, result)
+        self.convo.maybe_name_session(self.current_session_id)
+        if self.convo.should_compact(self.current_session_id):
+            report = self.convo.compact(self.current_session_id)
+            if report.get("compacted"):
+                result["auto_compacted"] = report
         return result
+
+    # ----- chat sessions -------------------------------------------------- #
+    def new_session(self) -> str:
+        self.current_session_id = self.convo.create_session()
+        return self.current_session_id
+
+    def list_chats(self) -> list[dict[str, Any]]:
+        return self.convo.list_sessions()
+
+    def open_chat(self, ref: str) -> str | None:
+        """Resolve a /chats index (1-based) or session-id prefix to a session."""
+        sessions = self.convo.list_sessions()
+        target: str | None = None
+        if ref.isdigit():
+            idx = int(ref) - 1
+            if 0 <= idx < len(sessions):
+                target = sessions[idx]["session_id"]
+        else:
+            target = next((s["session_id"] for s in sessions if s["session_id"].startswith(ref)), None)
+        if target is not None:
+            self.current_session_id = target
+        return target
+
+    def render_history_lines(self, session_id: str) -> list[str]:
+        info = self.convo.get_session(session_id) or {}
+        messages = self.convo.get_messages(session_id)
+        title = info.get("title") or session_id[:8]
+        lines = [f"[dim]— chat: {title} ({len(messages)} messages) —[/dim]"]
+        if info.get("has_summary"):
+            lines.append("[dim]— earlier turns are summarized —[/dim]")
+        for m in messages:
+            if m["role"] == "user":
+                lines.append(f"[b cyan]you[/b cyan] {m['content']}")
+            else:
+                lines.append(f"[b green]agent[/b green] {m['content']}")
+                if m.get("actions"):
+                    lines.append(f"  [dim]→ {'; '.join(m['actions'])}[/dim]")
+        return lines
+
+    def compact_current(self, instructions: str | None = None) -> dict[str, Any]:
+        return self.convo.compact(self.current_session_id, instructions)
+
+    def context_fraction(self) -> float:
+        return self.convo.context_fraction(self.current_session_id)
+
+    def chat_title(self) -> str | None:
+        return (self.convo.get_session(self.current_session_id) or {}).get("title")
 
     def soft_estop(self) -> dict[str, Any]:
         return self.services.task_manager.emergency_stop()
@@ -214,6 +285,29 @@ class AgentConsole:
                 return CommandResult(["soft e-stop released"])
             except Exception as exc:  # noqa: BLE001 - surface any failure to the user
                 return CommandResult([f"could not release e-stop: {exc}"])
+
+        if cmd == "new":
+            self.new_session()
+            return CommandResult(["[dim]started a new chat[/dim]"], clear=True)
+
+        if cmd in ("chats", "list", "history"):
+            sessions = self.list_chats()
+            if not sessions:
+                return CommandResult(["no chats yet"])
+            lines = ["[b]Chats[/b] (newest first; use /open <n>)"]
+            for i, s in enumerate(sessions, 1):
+                here = " [green]● current[/green]" if s["session_id"] == self.current_session_id else ""
+                title = s["title"] or "(unnamed)"
+                lines.append(f"  {i}. {title}  [dim]{s['message_count']} msgs[/dim]{here}")
+            return CommandResult(lines)
+
+        if cmd in ("open", "switch"):
+            if not args:
+                return CommandResult(["usage: /open <number from /chats>"])
+            target = self.open_chat(args[0])
+            if target is None:
+                return CommandResult([f"no such chat: {args[0]} (see /chats)"])
+            return CommandResult(self.render_history_lines(target), clear=True)
 
         if cmd in ("help", "?"):
             return CommandResult(list(HELP_LINES))
@@ -324,6 +418,20 @@ if _TEXTUAL_AVAILABLE:
             if not text:
                 return
             if text.startswith("/"):
+                body = text[1:].strip()
+                cmd = body.split()[0].lower() if body else ""
+                # /compact calls the model — run it off the UI thread with the
+                # same "thinking" indicator as a chat turn.
+                if cmd == "compact":
+                    if self._busy:
+                        self._write("[yellow]still working on the previous message…[/yellow]")
+                        return
+                    instructions = body[len("compact"):].strip() or None
+                    self._write("[yellow]🗜 Compacting conversation…[/yellow]")
+                    self._busy = True
+                    self._think_start = time.monotonic()
+                    self._compact_worker(instructions)
+                    return
                 result = self.ctl.run_command(text)
                 if result.clear:
                     self.log_widget.clear()
@@ -383,6 +491,17 @@ if _TEXTUAL_AVAILABLE:
             finally:
                 self.call_from_thread(self._set_idle)
 
+        @work(thread=True, group="chat")
+        def _compact_worker(self, instructions: str | None) -> None:
+            try:
+                report = self.ctl.compact_current(instructions)
+            except Exception as exc:  # noqa: BLE001
+                self.call_from_thread(self._write, f"[red]compact failed:[/red] {exc}")
+            else:
+                self.call_from_thread(self._render_compact, report)
+            finally:
+                self.call_from_thread(self._set_idle)
+
         @work(thread=True, group="estop")
         def _estop_worker(self, panic: bool) -> None:
             try:
@@ -422,10 +541,21 @@ if _TEXTUAL_AVAILABLE:
             mode = "[green]DRY[/green]" if self.ctl.dry_run else "[red]LIVE[/red]"
             profile = self.ctl.current_profile()
             addr = f"{self.ctl.robot_addr}" + (f" ({profile})" if profile else "")
+            try:
+                pct = int(round(self.ctl.context_fraction() * 100))
+            except Exception:  # noqa: BLE001
+                pct = 0
+            threshold = int(self.ctl.services.settings.auto_compact_threshold * 100)
+            ctx = f"[yellow]ctx {pct}%[/yellow]" if pct >= threshold else f"ctx {pct}%"
+            title = self.ctl.chat_title() or "new chat"
             self.call_from_thread(
                 self.status_widget.update,
-                f"{mode} {addr} · {_format_status(state)}",
+                f"{mode} {addr} · {_format_status(state)} · {ctx}",
             )
+            self.call_from_thread(self._set_subtitle, title)
+
+        def _set_subtitle(self, title: str) -> None:
+            self.sub_title = title
 
         def _animate_thinking(self) -> None:
             if self._busy:
@@ -446,6 +576,16 @@ if _TEXTUAL_AVAILABLE:
             self._busy = False
             self.thinking_widget.update("")
             self._thinking_shown = False
+
+        def _render_compact(self, report: dict[str, Any]) -> None:
+            if report.get("compacted"):
+                was = int(round(report.get("before_fraction", 0) * 100))
+                self._write(
+                    f"[yellow]🗜 Compacted: summarized {report.get('removed', 0)} earlier "
+                    f"messages, kept the last {report.get('kept', 0)} (context was {was}% full)[/yellow]"
+                )
+            else:
+                self._write(f"[dim]nothing to compact ({report.get('reason', 'n/a')})[/dim]")
 
         def _render_result(self, result: dict[str, Any]) -> None:
             for call in result.get("tool_calls", []):
@@ -469,6 +609,13 @@ if _TEXTUAL_AVAILABLE:
             for mission_id in result.get("created_mission_ids", []):
                 self._write(f"  [blue]＋ mission {mission_id[:8]}[/blue]")
             self._write(f"[b green]agent[/b green] {result.get('assistant_response', '')}")
+            auto = result.get("auto_compacted")
+            if auto and auto.get("compacted"):
+                was = int(round(auto.get("before_fraction", 0) * 100))
+                self._write(
+                    f"[yellow]🗜 Auto-compacted: summarized {auto.get('removed', 0)} earlier "
+                    f"messages (context was {was}% full)[/yellow]"
+                )
             metrics = result.get("metrics")
             if metrics is not None and getattr(metrics, "calls", 0):
                 self._write(

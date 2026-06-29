@@ -38,7 +38,11 @@ class AgentPlanner:
         }
 
     def _compact_missions(self) -> dict[str, Any]:
-        missions = self.mission_manager.list_missions()[:3]
+        # Only surface missions that are still in flight — finished/failed ones
+        # are durable history, not live context, and shouldn't resurface (e.g.
+        # after a restart) and confuse the agent.
+        active = {"created", "running", "waiting"}
+        missions = [m for m in self.mission_manager.list_missions() if m["status"] in active][:3]
         return {
             "recent_missions": [
                 {
@@ -51,7 +55,12 @@ class AgentPlanner:
             ]
         }
 
-    def run_chat(self, message: str) -> dict[str, Any]:
+    def run_chat(
+        self,
+        message: str,
+        history: list[dict[str, Any]] | None = None,
+        summary: str | None = None,
+    ) -> dict[str, Any]:
         # Let create_mission record the originating request.
         self.tool_registry.current_message = message
 
@@ -75,8 +84,13 @@ class AgentPlanner:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": build_system_prompt()},
             {"role": "system", "content": build_runtime_context(state_summary, locations, missions, identity, chargers)},
-            {"role": "user", "content": message},
         ]
+        # Prior conversation: a summary of compacted turns (if any) then the
+        # retained recent turns, before the new user message.
+        if summary:
+            messages.append({"role": "system", "content": f"Summary of earlier conversation: {summary}"})
+        messages.extend(history or [])
+        messages.append({"role": "user", "content": message})
 
         for _ in range(4):
             try:

@@ -70,6 +70,27 @@ def test_agent_chat_creates_mission_via_tool(tmp_path: Path):
         assert payload["created_mission_ids"]
 
 
+def test_run_chat_injects_history_and_summary(tmp_path: Path):
+    with build_test_client(tmp_path, llm_dry_run=False) as client:
+        planner = client.app.state.services.agent_planner
+        captured: dict = {}
+
+        def fake_chat(messages, tools):
+            captured["messages"] = messages
+            return {"choices": [{"message": {"content": "ok", "tool_calls": []}}]}
+
+        planner.llm_client.chat_with_tools = fake_chat  # type: ignore[method-assign]
+        history = [
+            {"role": "user", "content": "go to kitchen"},
+            {"role": "assistant", "content": "done"},
+        ]
+        planner.run_chat("now come back", history=history, summary="Earlier: robot was idle.")
+        messages = captured["messages"]
+        assert any("Earlier: robot was idle." in (m.get("content") or "") for m in messages)
+        assert {"role": "user", "content": "go to kitchen"} in messages
+        assert messages[-1] == {"role": "user", "content": "now come back"}
+
+
 def test_agent_chat_creates_mission_for_multistep_request(tmp_path: Path):
     with build_test_client(tmp_path) as client:
         response = client.post("/agent/chat", json={"message": "Go to front desk, then wait 1 second, then return to charger"})

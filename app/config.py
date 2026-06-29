@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     llm_dry_run: bool = False
     llm_timeout_seconds: float = 120.0
     llm_max_tokens: int = 1024
+    # Total context window of the served model (Qwen3-32B-4bit reports
+    # max_position_embeddings=40960). Used as the denominator for the live
+    # context-fullness gauge and the auto-compact trigger.
+    llm_context_window: int = 40960
+    # Compact the conversation once a turn's prompt tokens reach this fraction
+    # of the context window, keeping the most recent turns verbatim.
+    auto_compact_threshold: float = 0.8
+    compact_keep_recent_turns: int = 4
 
     mission_poll_seconds: float = 2.0
     mission_max_replans: int = 2

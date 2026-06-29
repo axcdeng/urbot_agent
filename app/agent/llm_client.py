@@ -44,6 +44,10 @@ class LLMMetrics:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     elapsed_s: float = 0.0
+    # Prompt tokens of the most recent call — the fullest single context we
+    # sent this turn (a tool loop makes several calls; the last is the biggest).
+    # Used as the context-fullness gauge, vs cumulative prompt_tokens above.
+    last_prompt_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -66,10 +70,13 @@ class LLMClient:
 
     def _record(self, data: dict[str, Any], elapsed: float) -> None:
         usage = (data or {}).get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
         self.metrics.calls += 1
-        self.metrics.prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.metrics.prompt_tokens += prompt_tokens
         self.metrics.completion_tokens += int(usage.get("completion_tokens") or 0)
         self.metrics.elapsed_s += elapsed
+        if prompt_tokens:
+            self.metrics.last_prompt_tokens = prompt_tokens
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.settings.llm_api_key}"}
@@ -118,3 +125,29 @@ class LLMClient:
         self._record(data, time.perf_counter() - t0)
         content = data["choices"][0]["message"].get("content", "{}")
         return extract_json_object(content)
+
+    def complete(self, prompt: str, max_tokens: int | None = None) -> str:
+        """Plain-text completion for short utilities (chat titles, summaries).
+
+        Returns the assistant text with any <think> reasoning block stripped.
+        Raises WaterClientError on transport failure; callers fall back when the
+        LLM is disabled/dry-run (both return an empty string here).
+        """
+        if not self.settings.llm_enabled or self.settings.llm_dry_run:
+            return ""
+        payload = {
+            "model": self.settings.llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens or self.settings.llm_max_tokens,
+        }
+        url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
+        try:
+            t0 = time.perf_counter()
+            response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WaterClientError(f"Completion request failed: {exc}") from exc
+        self._record(data, time.perf_counter() - t0)
+        content = data["choices"][0]["message"].get("content", "") or ""
+        return _THINK_RE.sub("", content).strip()

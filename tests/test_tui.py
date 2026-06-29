@@ -114,3 +114,42 @@ def test_chat_with_then_but_no_movement_does_not_crash(tmp_path: Path):
     result = console.chat("Hey, what's your battery and then list all the locations you can go to")
     assert "assistant_response" in result
     assert not result.get("created_mission_ids")
+
+
+def test_chat_has_memory_within_session(tmp_path: Path):
+    console = build_console(tmp_path)
+    console.chat("first message")
+    _, history = console.convo.build_history(console.current_session_id)
+    assert len(history) == 2  # user + assistant
+    console.chat("second message")
+    _, history = console.convo.build_history(console.current_session_id)
+    assert len(history) == 4
+
+
+def test_new_chats_and_open_commands(tmp_path: Path):
+    console = build_console(tmp_path)
+    console.chat("go to the kitchen")
+    first = console.current_session_id
+
+    res = console.run_command("/new")
+    assert res.clear is True
+    assert console.current_session_id != first
+    console.chat("what is your battery")
+
+    chats = console.run_command("/chats").lines
+    assert len(chats) >= 3  # header + 2 chats
+
+    sessions = console.list_chats()
+    idx = next(i for i, s in enumerate(sessions, 1) if s["session_id"] == first)
+    out = console.run_command(f"/open {idx}")
+    assert out.clear is True
+    assert console.current_session_id == first
+    assert any("kitchen" in line.lower() for line in out.lines)
+
+
+def test_compact_current_offline(tmp_path: Path):
+    console = build_console(tmp_path, compact_keep_recent_turns=1)
+    for i in range(4):
+        console.chat(f"message {i}")
+    report = console.compact_current()
+    assert report["compacted"] is True

@@ -37,8 +37,35 @@ def build_system_prompt() -> str:
         "- Safety (battery, e-stop, already-moving, unknown target) is enforced by the backend; if a "
         "tool reports it was blocked or failed, tell the user plainly what happened and why.\n"
         "- Answer questions directly with the read tools; combine multiple tool calls in one turn when needed.\n"
+        "- Earlier parts of a long conversation may be condensed into a summary message; treat it as "
+        "an accurate record of what was already said and done.\n"
         "- After acting, give a SHORT, factual, plain-language summary of what you did or found. "
         "No invented details, no raw JSON, no emojis."
+    )
+
+
+def build_title_prompt(first_user: str, first_assistant: str) -> str:
+    return (
+        "Give a SHORT title (3-6 words) for this robot-control chat, based on the first exchange. "
+        "Plain text only: no quotes, no punctuation at the ends, no emojis, Title Case.\n"
+        f"User: {first_user}\n"
+        f"Assistant: {first_assistant}\n"
+        "Title:"
+    )
+
+
+def build_compaction_prompt(history_text: str, instructions: str | None = None) -> str:
+    focus = f"\nPay special attention to: {instructions}\n" if instructions else ""
+    return (
+        "You are compacting an ongoing robot-control conversation to save context. "
+        "Write a concise summary (a few short paragraphs or bullet points) that preserves what is "
+        "needed to continue seamlessly: the user's goals and preferences, key facts established, "
+        "robot actions already taken (moves, missions, e-stops) and their outcomes, the current "
+        "task state, and any pending follow-ups. Drop pleasantries and resolved back-and-forth. "
+        "Output ONLY the summary text — no preamble, no JSON.\n"
+        f"{focus}"
+        "Conversation so far:\n"
+        f"{history_text}\n"
     )
 
 
