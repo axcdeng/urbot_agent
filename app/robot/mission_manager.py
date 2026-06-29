@@ -89,6 +89,12 @@ class MissionManager:
         self.mission_planner = mission_planner
         self._polling_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        # Missions soft-stopped by the user: their pending steps are already
+        # canceled in the DB; this set only relabels the terminal status to
+        # CANCELED (vs SUCCEEDED) once the current step finishes. In-memory so
+        # no schema change; the stop *behavior* is persisted via the canceled
+        # steps, only the cosmetic label depends on this.
+        self._soft_stopped: set[str] = set()
 
     def _step_description(self, step: dict[str, Any]) -> str:
         step_type = step["step_type"]
@@ -192,6 +198,55 @@ class MissionManager:
             return MissionResult(mission, steps).to_dict()
         finally:
             session.close()
+
+    def soft_stop_mission(self, mission_id: str) -> dict[str, Any]:
+        """Gracefully stop a mission: let the current step finish, run no more.
+
+        Unlike e-stop (free-stop, immediate) or cancel_move (stop in place), this
+        does NOT touch the robot's in-progress motion — it just cancels the
+        not-yet-started steps. The mission ends after the current step completes.
+        """
+        session = self.session_factory()
+        try:
+            mission = session.get(MissionRecord, mission_id)
+            if mission is None:
+                raise ValueError(f"Mission '{mission_id}' not found.")
+            steps = list(session.scalars(select(MissionStepRecord).where(MissionStepRecord.mission_id == mission_id).order_by(MissionStepRecord.step_index)).all())
+            if mission.status in FINAL_MISSION_STATUSES:
+                return {"mission_id": mission_id, "status": mission.status, "canceled_pending_steps": 0, "already_finished": True}
+            canceled = 0
+            for step in steps:
+                # PENDING = not yet dispatched; a RUNNING/WAITING step is left to finish.
+                if step.status == MissionStepStatus.PENDING.value:
+                    step.status = MissionStepStatus.CANCELED.value
+                    step.error_message = "Skipped: soft stop after the current step."
+                    step.completed_at = utcnow()
+                    canceled += 1
+            self._soft_stopped.add(mission_id)
+            mission.error_message = "Soft stop: finishing the current step, then stopping."
+            mission.updated_at = utcnow()
+            self._refresh_summary(mission, steps)
+            session.commit()
+            has_running = any(s.status in {MissionStepStatus.RUNNING.value, MissionStepStatus.WAITING.value} for s in steps)
+            return {
+                "mission_id": mission_id,
+                "status": mission.status,
+                "canceled_pending_steps": canceled,
+                "finishing_current_step": has_running,
+            }
+        finally:
+            session.close()
+
+    def _finalize_if_complete(self, mission: MissionRecord) -> None:
+        """Set the terminal status when no steps remain: CANCELED if the mission
+        was soft-stopped, otherwise SUCCEEDED."""
+        if mission.id in self._soft_stopped:
+            mission.status = MissionStatus.CANCELED.value
+            mission.error_message = mission.error_message or "Soft-stopped after the current step."
+            self._soft_stopped.discard(mission.id)
+        else:
+            mission.status = MissionStatus.SUCCEEDED.value
+        mission.completed_at = mission.completed_at or utcnow()
 
     def get_mission_context(self, mission_id: str) -> dict[str, Any]:
         mission = self.get_mission(mission_id)
@@ -374,8 +429,7 @@ class MissionManager:
                 steps = list(session.scalars(select(MissionStepRecord).where(MissionStepRecord.mission_id == mission.id).order_by(MissionStepRecord.step_index)).all())
                 current_step = next((step for step in steps if step.status not in FINAL_STEP_STATUSES), None)
                 if current_step is None:
-                    mission.status = MissionStatus.SUCCEEDED.value
-                    mission.completed_at = mission.completed_at or utcnow()
+                    self._finalize_if_complete(mission)
                     self._refresh_summary(mission, steps)
                     continue
 
@@ -417,8 +471,7 @@ class MissionManager:
                             mission.status = MissionStatus.RUNNING.value
 
                 if mission.status == MissionStatus.RUNNING.value and all(step.status in FINAL_STEP_STATUSES for step in steps):
-                    mission.status = MissionStatus.SUCCEEDED.value
-                    mission.completed_at = utcnow()
+                    self._finalize_if_complete(mission)
                 elif mission.status in {MissionStatus.FAILED.value, MissionStatus.CANCELED.value} and mission.completed_at is None:
                     mission.completed_at = utcnow()
 

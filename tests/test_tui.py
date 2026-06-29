@@ -147,6 +147,18 @@ def test_new_chats_and_open_commands(tmp_path: Path):
     assert any("kitchen" in line.lower() for line in out.lines)
 
 
+def test_soft_stop_command(tmp_path: Path):
+    console = build_console(tmp_path)
+    # Nothing running -> nothing to gracefully stop.
+    assert "no active mission" in console.run_command("/stop").lines[0]
+    # Build a multi-step mission via the offline heuristic, dispatch step 0, stop.
+    result = console.chat("go to front desk, then go to Kitchen, then go to Meetingroom")
+    assert result.get("created_mission_ids")
+    console.poll()  # dispatches the first step
+    out = console.run_command("/stop")
+    assert "soft stop" in out.lines[0].lower()
+
+
 def test_compact_current_offline(tmp_path: Path):
     console = build_console(tmp_path, compact_keep_recent_turns=1)
     for i in range(4):

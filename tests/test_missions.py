@@ -61,6 +61,40 @@ def test_mission_runs_steps_sequentially(tmp_path: Path):
     assert [step["status"] for step in result["steps"]] == ["succeeded", "succeeded", "succeeded"]
 
 
+def test_soft_stop_finishes_current_step_then_stops(tmp_path: Path):
+    mission_manager, task_manager, _ = build_mission_manager(tmp_path)
+    mission = mission_manager.create_mission(
+        user_request="Visit three places",
+        steps=[
+            {"step_type": "move_marker", "marker_name": "front_desk"},
+            {"step_type": "move_marker", "marker_name": "Kitchen"},
+            {"step_type": "move_marker", "marker_name": "Meetingroom"},
+        ],
+        auto_replan=False,
+    )
+    mission_id = mission["mission_id"]
+
+    # Dispatch step 0 -> running.
+    mission_manager.poll_missions()
+    assert mission_manager.get_mission(mission_id)["steps"][0]["status"] == "running"
+
+    # Soft stop: the running step is left alone; the two pending steps are canceled.
+    report = mission_manager.soft_stop_mission(mission_id)
+    assert report["canceled_pending_steps"] == 2
+    assert report["finishing_current_step"] is True
+
+    # Let the in-progress move finish; the mission then stops (no more steps run).
+    for _ in range(6):
+        task_manager.poll_active_tasks()
+        mission_manager.poll_missions()
+
+    result = mission_manager.get_mission(mission_id)
+    assert result["status"] == "canceled"  # soft-stopped, not "succeeded"
+    statuses = [step["status"] for step in result["steps"]]
+    assert statuses[0] == "succeeded"  # current step ran to completion
+    assert statuses[1] == "canceled" and statuses[2] == "canceled"
+
+
 def test_mission_replan_uses_compact_context(tmp_path: Path):
     mission_manager, task_manager, mission_planner = build_mission_manager(tmp_path)
     mission = mission_manager.create_mission(

@@ -53,6 +53,7 @@ HELP_LINES = [
     "  /ip <profile>      switch robot + map by profile (primary, secondary)",
     "  /status            current robot state",
     "  /markers           known markers and aliases",
+    "  /stop              graceful stop: finish the current step, run no more",
     "  /release           release the soft e-stop",
     "  /new               start a new chat",
     "  /chats             list previous chats",
@@ -205,6 +206,23 @@ class AgentConsole:
     def soft_estop(self) -> dict[str, Any]:
         return self.services.task_manager.emergency_stop()
 
+    def soft_stop(self) -> dict[str, Any]:
+        """Graceful stop: let the active mission's current step finish, run no more.
+
+        Only meaningful for a multi-step mission (a lone move just completes). Does
+        not touch the robot's in-progress motion — unlike Esc (e-stop) or cancel.
+        """
+        active = next(
+            (m for m in self.services.mission_manager.list_missions()
+             if m["status"] in {"created", "running", "waiting"}),
+            None,
+        )
+        if active is None:
+            return {"stopped": False, "reason": "no active mission"}
+        report = self.services.mission_manager.soft_stop_mission(active["mission_id"])
+        report["stopped"] = True
+        return report
+
     def cancel_active_move(self) -> dict[str, Any]:
         return self.services.task_manager.cancel_current_move()
 
@@ -285,6 +303,19 @@ class AgentConsole:
                 return CommandResult(["soft e-stop released"])
             except Exception as exc:  # noqa: BLE001 - surface any failure to the user
                 return CommandResult([f"could not release e-stop: {exc}"])
+
+        if cmd == "stop":
+            report = self.soft_stop()
+            if not report.get("stopped"):
+                return CommandResult([
+                    "no active mission to stop — a single move just finishes on its own. "
+                    "(Press Esc for an immediate e-stop.)"
+                ])
+            tail = " — finishing the current step first" if report.get("finishing_current_step") else ""
+            return CommandResult([
+                f"soft stop{tail}; canceled {report['canceled_pending_steps']} upcoming step(s). "
+                "The robot will not start another step."
+            ])
 
         if cmd == "new":
             self.new_session()
