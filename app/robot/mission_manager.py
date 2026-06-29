@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
@@ -89,6 +89,11 @@ class MissionManager:
         self.mission_planner = mission_planner
         self._polling_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
+        # A step claimed for dispatch but never linked to a task is "in flight"
+        # only briefly (bounded by the move HTTP timeout). Past this grace period
+        # we treat it as orphaned by a crashed poller and recover it. Kept well
+        # above the HTTP timeout so we never disturb a dispatch still in progress.
+        self._orphan_grace_seconds = max(30.0, settings.water_timeout_seconds * 2)
 
     def _step_description(self, step: dict[str, Any]) -> str:
         step_type = step["step_type"]
@@ -237,6 +242,52 @@ class MissionManager:
             "error_message": mission.error_message,
         }
 
+    def _claim_step(self, step_id: str) -> bool:
+        """Atomically transition a PENDING step to RUNNING so only one poller dispatches it.
+
+        Multiple pollers (e.g. more than one running process, all pointed at the
+        same database) can each see a step as PENDING and dispatch it, sending
+        duplicate move commands to the robot — which the robot then rejects with
+        "Robot is already moving", failing the mission. This conditional UPDATE is
+        serialized by the database, so exactly one caller observes rowcount == 1
+        and is allowed to dispatch; everyone else gets False and backs off.
+
+        Uses its own short-lived session and commits immediately, so the claim is
+        durable before the slow move dispatch runs.
+        """
+        session = self.session_factory()
+        try:
+            result = session.execute(
+                update(MissionStepRecord)
+                .where(MissionStepRecord.id == step_id)
+                .where(MissionStepRecord.status == MissionStepStatus.PENDING.value)
+                .values(status=MissionStepStatus.RUNNING.value, updated_at=utcnow())
+            )
+            session.commit()
+            return result.rowcount == 1
+        finally:
+            session.close()
+
+    def _recover_orphaned_step(self, step: MissionStepRecord) -> None:
+        """Recover a step stuck RUNNING with no task_id (its dispatcher crashed).
+
+        A step holds this state only between being claimed and its task being
+        recorded — normally within one poll pass. If it persists, the poller that
+        claimed it died mid-dispatch. If a task was actually created we re-link to
+        it; otherwise, once the claim is stale beyond the grace period (so we never
+        clobber a dispatch still running in another poller), we re-queue the step.
+        """
+        task = self.task_manager.find_latest_task_for_step(step.id)
+        if task is not None:
+            step.task_id = task["task_id"]
+            step.updated_at = utcnow()
+            return
+        last_update = ensure_utc(step.updated_at) if step.updated_at else None
+        if last_update is None or (utcnow() - last_update).total_seconds() >= self._orphan_grace_seconds:
+            step.status = MissionStepStatus.PENDING.value
+            step.started_at = None
+            step.updated_at = utcnow()
+
     def _mark_step_complete(self, mission: MissionRecord, step: MissionStepRecord, status: MissionStepStatus, *, result: dict[str, Any] | None = None, error_message: str | None = None) -> None:
         step.status = status.value
         step.compact_result = result
@@ -380,6 +431,17 @@ class MissionManager:
                     continue
 
                 if current_step.status == MissionStepStatus.PENDING.value:
+                    # Release this session's read transaction, then atomically
+                    # claim the step. This both prevents a concurrent poller from
+                    # dispatching the same step and avoids self-contention with the
+                    # task INSERT during the (slow) move dispatch below. Note: this
+                    # commit also flushes any earlier missions mutated in this pass,
+                    # which is harmless (they would be committed at the end anyway).
+                    session.commit()
+                    if not self._claim_step(current_step.id):
+                        # Another poller already owns this step; leave it to them.
+                        continue
+                    current_step.status = MissionStepStatus.RUNNING.value
                     try:
                         self._dispatch_step(mission, current_step)
                     except Exception as exc:
@@ -391,6 +453,11 @@ class MissionManager:
 
                 elif current_step.status == MissionStepStatus.WAITING.value:
                     self._handle_wait_step(mission, current_step)
+
+                elif current_step.status == MissionStepStatus.RUNNING.value and not current_step.task_id:
+                    # Claimed for dispatch but never linked to a task: recover it
+                    # so a crashed poller can't strand the mission in RUNNING.
+                    self._recover_orphaned_step(current_step)
 
                 elif current_step.status == MissionStepStatus.RUNNING.value and current_step.task_id:
                     task = self.task_manager.get_task(current_step.task_id)

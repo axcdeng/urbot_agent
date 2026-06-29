@@ -60,17 +60,25 @@ class TaskManager:
         self._polling_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
 
-    def _log(self, level: str, event_type: str, message: str, payload: dict[str, Any] | None = None) -> None:
+    def _log(self, level: str, event_type: str, message: str, payload: dict[str, Any] | None = None, *, session=None) -> None:
         logger.log(getattr(logging, level.upper(), logging.INFO), "%s: %s", event_type, message)
-        session = self.session_factory()
+        event = EventLog(level=level.upper(), event_type=event_type, message=message, payload=payload)
+        if session is not None:
+            # Persist within the caller's open transaction. Opening a second
+            # connection here would contend with the caller's uncommitted write
+            # and stall on SQLite's busy timeout (~5s per task creation), which
+            # also widens the window for concurrent pollers to double-dispatch.
+            session.add(event)
+            return
+        own = self.session_factory()
         try:
-            session.add(EventLog(level=level.upper(), event_type=event_type, message=message, payload=payload))
-            session.commit()
+            own.add(event)
+            own.commit()
         except Exception:
-            session.rollback()
+            own.rollback()
             logger.debug("Skipping event log persistence for %s due to a transient database error.", event_type, exc_info=True)
         finally:
-            session.close()
+            own.close()
 
     def _new_task(
         self,
@@ -93,7 +101,7 @@ class TaskManager:
         )
         session.add(record)
         session.flush()
-        self._log("info", "task_created", f"Created task {record.id}", {"task_type": task_type.value, "target": requested_target})
+        self._log("info", "task_created", f"Created task {record.id}", {"task_type": task_type.value, "target": requested_target}, session=session)
         return record
 
     def _set_status(self, record: TaskRecord, status: TaskStatus, *, error_message: str | None = None, raw_response: dict[str, Any] | None = None, robot_task_id: str | None = None) -> None:
@@ -121,6 +129,24 @@ class TaskManager:
             if record is None:
                 raise ValueError(f"Task '{task_id}' not found.")
             return TaskResult(record).to_dict()
+        finally:
+            session.close()
+
+    def find_latest_task_for_step(self, mission_step_id: str) -> dict[str, Any] | None:
+        """Most recent task created for a mission step, or None.
+
+        Used to recover a step left RUNNING with no recorded task_id: the task it
+        spawned (if any) carries the step id, so we can re-link instead of blindly
+        re-dispatching.
+        """
+        session = self.session_factory()
+        try:
+            record = session.scalars(
+                select(TaskRecord)
+                .where(TaskRecord.mission_step_id == mission_step_id)
+                .order_by(TaskRecord.created_at.desc())
+            ).first()
+            return TaskResult(record).to_dict() if record is not None else None
         finally:
             session.close()
 

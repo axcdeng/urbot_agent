@@ -87,7 +87,10 @@ class AgentToolRegistry:
                         "Create a durable, ordered multi-step mission. Use this whenever the user "
                         "asks for a SEQUENCE of actions (e.g. go somewhere, wait, then go elsewhere, "
                         "then return to charger) instead of issuing several move_to_location calls. "
-                        "Missions persist and auto-replan. Use only known markers/aliases."
+                        "Missions persist and auto-replan. Use only known markers/aliases. "
+                        "IMPORTANT: a mission STARTS RUNNING the moment it is created — the robot "
+                        "begins the first step immediately. There is no separate 'start' action and "
+                        "you do NOT need to ask the user whether to begin."
                     ),
                     "parameters": {
                         "type": "object",
