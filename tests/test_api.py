@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -6,14 +7,15 @@ from app.config import Settings
 from app.main import create_app
 
 
-def build_test_client(tmp_path: Path) -> TestClient:
-    settings = Settings(
+def build_test_client(tmp_path: Path, **overrides) -> TestClient:
+    params = dict(
         database_url=f"sqlite:///{tmp_path / 'api.db'}",
         water_dry_run=True,
         llm_enabled=True,
         llm_dry_run=True,
     )
-    return TestClient(create_app(settings))
+    params.update(overrides)
+    return TestClient(create_app(Settings(**params)))
 
 
 def test_health_and_task_routes(tmp_path: Path):
@@ -25,7 +27,9 @@ def test_health_and_task_routes(tmp_path: Path):
 
 
 def test_agent_chat_json_fallback(tmp_path: Path):
-    with build_test_client(tmp_path) as client:
+    # llm_dry_run=False so run_chat takes the live tool path; the mocks then
+    # force the tool call to fail and exercise the JSON fallback.
+    with build_test_client(tmp_path, llm_dry_run=False) as client:
         planner = client.app.state.services.agent_planner
         planner.llm_client.chat_with_tools = lambda *args, **kwargs: (_ for _ in ()).throw(Exception("unsupported"))  # type: ignore[method-assign]
         planner.llm_client.json_plan = lambda prompt: {  # type: ignore[method-assign]
@@ -36,6 +40,34 @@ def test_agent_chat_json_fallback(tmp_path: Path):
         payload = response.json()
         assert response.status_code == 200
         assert payload["created_task_ids"]
+
+
+def test_agent_chat_creates_mission_via_tool(tmp_path: Path):
+    # Live tool path: the model calls the create_mission tool, then replies.
+    with build_test_client(tmp_path, llm_dry_run=False) as client:
+        planner = client.app.state.services.agent_planner
+        calls = {"n": 0}
+
+        def fake_chat(messages, tools):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                args = json.dumps({
+                    "steps": [
+                        {"step_type": "move_marker", "marker_name": "front_desk"},
+                        {"step_type": "return_to_charger"},
+                    ],
+                    "mission_name": "demo",
+                })
+                return {"choices": [{"message": {"content": "", "tool_calls": [
+                    {"id": "1", "type": "function", "function": {"name": "create_mission", "arguments": args}},
+                ]}}]}
+            return {"choices": [{"message": {"content": "Mission created.", "tool_calls": []}}]}
+
+        planner.llm_client.chat_with_tools = fake_chat  # type: ignore[method-assign]
+        response = client.post("/agent/chat", json={"message": "go to front desk then return to charger"})
+        payload = response.json()
+        assert response.status_code == 200
+        assert payload["created_mission_ids"]
 
 
 def test_agent_chat_creates_mission_for_multistep_request(tmp_path: Path):

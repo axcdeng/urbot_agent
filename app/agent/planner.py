@@ -10,6 +10,7 @@ from app.agent.tools import AgentToolRegistry
 from app.robot.locations import LocationRegistry
 from app.robot.mission_manager import MissionManager
 from app.robot.state_manager import StateManager
+from app.water.schemas import WaterClientError
 
 
 class AgentPlanner:
@@ -51,28 +52,18 @@ class AgentPlanner:
         }
 
     def run_chat(self, message: str) -> dict[str, Any]:
-        # The sequence heuristic ("... then ...") over-triggers on ordinary
-        # questions like "what's your battery and then list locations". Only
-        # create a mission when planning actually produced steps; otherwise fall
-        # through to the normal tool-answering path.
-        if self.mission_planner.should_plan_mission(message):
-            planned = self.mission_planner.plan_steps_from_text(message)
-            if planned.get("steps"):
-                mission = self.mission_manager.create_mission(
-                    user_request=message,
-                    steps=planned["steps"],
-                    name=planned.get("mission_name"),
-                    auto_replan=True,
-                )
-                return {
-                    "assistant_response": planned.get("response", "Created a mission."),
-                    "tool_calls": [],
-                    "created_task_ids": [],
-                    "created_mission_ids": [mission["mission_id"]],
-                    "final_robot_state": self.state_manager.get_compact_robot_state(),
-                    "mission": mission,
-                }
+        # Let create_mission record the originating request.
+        self.tool_registry.current_message = message
 
+        settings = self.llm_client.settings
+        # No live tool-calling model available: fall back to the phrasing
+        # heuristic (the only way to act without an LLM).
+        if not settings.llm_enabled or settings.llm_dry_run:
+            return self._run_offline(message)
+
+        # Single tool-calling loop. The model decides everything — including
+        # whether a request is a durable multi-step mission (create_mission tool)
+        # versus a single move or a status question. No keyword routing.
         tool_calls_used: list[dict[str, Any]] = []
         created_task_ids: list[str] = []
         created_mission_ids: list[str] = []
@@ -118,15 +109,20 @@ class AgentPlanner:
                 name = function.get("name")
                 arguments = function.get("arguments") or "{}"
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
-                execution = self.tool_registry.execute(name, parsed_arguments)
-                tool_calls_used.append({"name": name, "arguments": parsed_arguments, "payload": execution.payload})
-                created_task_ids.extend(execution.task_ids)
+                try:
+                    execution = self.tool_registry.execute(name, parsed_arguments)
+                    payload = execution.payload
+                    created_task_ids.extend(execution.task_ids)
+                    created_mission_ids.extend(execution.mission_ids)
+                except Exception as exc:  # surface tool errors back to the model instead of aborting
+                    payload = {"error": str(exc)}
+                tool_calls_used.append({"name": name, "arguments": parsed_arguments, "payload": payload})
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.get("id", name),
                         "name": name,
-                        "content": json.dumps(execution.payload),
+                        "content": json.dumps(payload),
                     }
                 )
 
@@ -138,20 +134,65 @@ class AgentPlanner:
             "final_robot_state": self.state_manager.get_compact_robot_state(),
         }
 
+    def _run_offline(self, message: str) -> dict[str, Any]:
+        """No-LLM path: build a mission from the phrasing heuristic if possible."""
+        steps = self.mission_planner.heuristic_steps(message)
+        if steps:
+            try:
+                mission = self.mission_manager.create_mission(
+                    user_request=message,
+                    steps=steps,
+                    name="Planned mission",
+                    auto_replan=True,
+                )
+            except ValueError as exc:
+                return self._simple_response(f"Could not build a mission: {exc}")
+            return {
+                "assistant_response": "Created a mission plan.",
+                "tool_calls": [],
+                "created_task_ids": [],
+                "created_mission_ids": [mission["mission_id"]],
+                "final_robot_state": self.state_manager.get_compact_robot_state(),
+                "mission": mission,
+            }
+        return self._simple_response(
+            "The language model is unavailable, so I can only act on explicit step commands "
+            "(e.g. 'go to front desk, then return to charger')."
+        )
+
+    def _simple_response(self, text: str) -> dict[str, Any]:
+        return {
+            "assistant_response": text,
+            "tool_calls": [],
+            "created_task_ids": [],
+            "created_mission_ids": [],
+            "final_robot_state": self.state_manager.get_compact_robot_state(),
+        }
+
     def _run_json_fallback(self, message: str) -> dict[str, Any]:
+        # Used when the model errors or doesn't support tool calling. Returns a
+        # single action; on its own failure, drops to the offline heuristic.
         state = self.state_manager.get_compact_robot_state()
         locations = self._compact_locations()
         missions = self._compact_missions()
         prompt = build_json_fallback_prompt(message, state, locations, missions)
-        plan = self.llm_client.json_plan(prompt)
+        try:
+            plan = self.llm_client.json_plan(prompt)
+        except WaterClientError:
+            return self._run_offline(message)
         tool_calls_used: list[dict[str, Any]] = []
         created_task_ids: list[str] = []
         created_mission_ids: list[str] = []
         if plan.get("action"):
             action = plan["action"]
-            execution = self.tool_registry.execute(action["tool"], action.get("arguments", {}))
-            tool_calls_used.append({"name": action["tool"], "arguments": action.get("arguments", {}), "payload": execution.payload})
-            created_task_ids.extend(execution.task_ids)
+            try:
+                execution = self.tool_registry.execute(action["tool"], action.get("arguments", {}))
+                payload = execution.payload
+                created_task_ids.extend(execution.task_ids)
+                created_mission_ids.extend(execution.mission_ids)
+            except Exception as exc:  # noqa: BLE001
+                payload = {"error": str(exc)}
+            tool_calls_used.append({"name": action["tool"], "arguments": action.get("arguments", {}), "payload": payload})
         return {
             "assistant_response": plan.get("response", "Done."),
             "tool_calls": tool_calls_used,

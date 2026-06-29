@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from app.agent.mission_planner import MissionPlanner
 from app.robot.locations import LocationRegistry
 from app.robot.mission_manager import MissionManager
 from app.robot.state_manager import StateManager
@@ -14,6 +15,7 @@ class ToolExecution:
     content: str
     task_ids: list[str]
     payload: dict[str, Any]
+    mission_ids: list[str] = field(default_factory=list)
 
 
 class AgentToolRegistry:
@@ -23,11 +25,16 @@ class AgentToolRegistry:
         location_registry: LocationRegistry,
         task_manager: TaskManager,
         mission_manager: MissionManager,
+        mission_planner: MissionPlanner,
     ):
         self.state_manager = state_manager
         self.location_registry = location_registry
         self.task_manager = task_manager
         self.mission_manager = mission_manager
+        self.mission_planner = mission_planner
+        # Set by the planner before each turn so create_mission can record the
+        # originating user request.
+        self.current_message: str | None = None
 
     def definitions(self) -> list[dict[str, Any]]:
         return [
@@ -51,7 +58,7 @@ class AgentToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "move_to_location",
-                    "description": "Move the robot to a known marker or alias by name.",
+                    "description": "Move the robot to ONE known marker or alias by name. Use this for a single destination.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -59,6 +66,43 @@ class AgentToolRegistry:
                             "allow_interruption": {"type": "boolean"},
                         },
                         "required": ["location_name"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_mission",
+                    "description": (
+                        "Create a durable, ordered multi-step mission. Use this whenever the user "
+                        "asks for a SEQUENCE of actions (e.g. go somewhere, wait, then go elsewhere, "
+                        "then return to charger) instead of issuing several move_to_location calls. "
+                        "Missions persist and auto-replan. Use only known markers/aliases."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "steps": {
+                                "type": "array",
+                                "description": "Ordered steps to execute.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "step_type": {
+                                            "type": "string",
+                                            "enum": ["move_marker", "wait", "return_to_charger", "cancel_move", "emergency_stop"],
+                                        },
+                                        "marker_name": {"type": "string", "description": "Required for move_marker; a known marker or alias."},
+                                        "wait_seconds": {"type": "integer", "description": "Required for wait."},
+                                        "description": {"type": "string"},
+                                    },
+                                    "required": ["step_type"],
+                                },
+                            },
+                            "mission_name": {"type": "string", "description": "Short title for the mission."},
+                        },
+                        "required": ["steps"],
                         "additionalProperties": False,
                     },
                 },
@@ -136,6 +180,20 @@ class AgentToolRegistry:
                 allow_interruption=bool(arguments.get("allow_interruption", False)),
             )
             return ToolExecution(content=f"Created move task {task['task_id']}.", task_ids=[task["task_id"]], payload=task)
+        if name == "create_mission":
+            steps = self.mission_planner.normalize_steps(arguments.get("steps") or [])
+            mission = self.mission_manager.create_mission(
+                user_request=self.current_message or "agent mission",
+                steps=steps,
+                name=arguments.get("mission_name"),
+                auto_replan=True,
+            )
+            return ToolExecution(
+                content=f"Created mission {mission['mission_id']}.",
+                task_ids=[],
+                payload=mission,
+                mission_ids=[mission["mission_id"]],
+            )
         if name == "cancel_current_task":
             task = self.task_manager.cancel_current_move()
             return ToolExecution(content=f"Created cancel task {task['task_id']}.", task_ids=[task["task_id"]], payload=task)

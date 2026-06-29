@@ -51,6 +51,14 @@ class MissionPlanner:
             normalized["description"] = str(step["description"]).strip()
         return normalized
 
+    def normalize_steps(self, raw_steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Public normalizer for externally-supplied steps (e.g. the LLM's create_mission tool)."""
+        return [self._normalize_step(step) for step in raw_steps]
+
+    def heuristic_steps(self, message: str) -> list[dict[str, Any]]:
+        """Public phrasing-based parser, used as the offline (no-LLM) fallback."""
+        return self._heuristic_steps(message)
+
     def _heuristic_steps(self, message: str) -> list[dict[str, Any]]:
         text = message.strip().lower()
         parts = [segment.strip(" ,.") for segment in re.split(r"\bthen\b|\bafter that\b|\bfinally\b|;", text) if segment.strip(" ,.")]

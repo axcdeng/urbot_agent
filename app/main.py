@@ -59,7 +59,7 @@ def build_services(settings: Settings) -> ServiceContainer:
     llm_client = LLMClient(settings)
     mission_planner = MissionPlanner(llm_client, location_registry, state_manager, settings)
     mission_manager = MissionManager(session_factory, task_manager, state_manager, location_registry, settings, mission_planner=mission_planner)
-    agent_tools = AgentToolRegistry(state_manager, location_registry, task_manager, mission_manager)
+    agent_tools = AgentToolRegistry(state_manager, location_registry, task_manager, mission_manager, mission_planner)
     agent_planner = AgentPlanner(llm_client, agent_tools, state_manager, location_registry, mission_manager, mission_planner)
     return ServiceContainer(
         settings=settings,
