@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
@@ -95,6 +95,11 @@ class MissionManager:
         # no schema change; the stop *behavior* is persisted via the canceled
         # steps, only the cosmetic label depends on this.
         self._soft_stopped: set[str] = set()
+        # A step claimed for dispatch but never linked to a task is "in flight"
+        # only briefly (bounded by the move HTTP timeout). Past this grace period
+        # we treat it as orphaned by a crashed poller and recover it. Kept well
+        # above the HTTP timeout so we never disturb a dispatch still in progress.
+        self._orphan_grace_seconds = max(30.0, settings.water_timeout_seconds * 2)
 
     def _step_description(self, step: dict[str, Any]) -> str:
         step_type = step["step_type"]
@@ -292,6 +297,52 @@ class MissionManager:
             "error_message": mission.error_message,
         }
 
+    def _claim_step(self, step_id: str) -> bool:
+        """Atomically transition a PENDING step to RUNNING so only one poller dispatches it.
+
+        Multiple pollers (e.g. more than one running process, all pointed at the
+        same database) can each see a step as PENDING and dispatch it, sending
+        duplicate move commands to the robot — which the robot then rejects with
+        "Robot is already moving", failing the mission. This conditional UPDATE is
+        serialized by the database, so exactly one caller observes rowcount == 1
+        and is allowed to dispatch; everyone else gets False and backs off.
+
+        Uses its own short-lived session and commits immediately, so the claim is
+        durable before the slow move dispatch runs.
+        """
+        session = self.session_factory()
+        try:
+            result = session.execute(
+                update(MissionStepRecord)
+                .where(MissionStepRecord.id == step_id)
+                .where(MissionStepRecord.status == MissionStepStatus.PENDING.value)
+                .values(status=MissionStepStatus.RUNNING.value, updated_at=utcnow())
+            )
+            session.commit()
+            return result.rowcount == 1
+        finally:
+            session.close()
+
+    def _recover_orphaned_step(self, step: MissionStepRecord) -> None:
+        """Recover a step stuck RUNNING with no task_id (its dispatcher crashed).
+
+        A step holds this state only between being claimed and its task being
+        recorded — normally within one poll pass. If it persists, the poller that
+        claimed it died mid-dispatch. If a task was actually created we re-link to
+        it; otherwise, once the claim is stale beyond the grace period (so we never
+        clobber a dispatch still running in another poller), we re-queue the step.
+        """
+        task = self.task_manager.find_latest_task_for_step(step.id)
+        if task is not None:
+            step.task_id = task["task_id"]
+            step.updated_at = utcnow()
+            return
+        last_update = ensure_utc(step.updated_at) if step.updated_at else None
+        if last_update is None or (utcnow() - last_update).total_seconds() >= self._orphan_grace_seconds:
+            step.status = MissionStepStatus.PENDING.value
+            step.started_at = None
+            step.updated_at = utcnow()
+
     def _mark_step_complete(self, mission: MissionRecord, step: MissionStepRecord, status: MissionStepStatus, *, result: dict[str, Any] | None = None, error_message: str | None = None) -> None:
         step.status = status.value
         step.compact_result = result
@@ -417,6 +468,97 @@ class MissionManager:
         mission.current_step_index = failed_step.step_index
         return True
 
+    def _load_steps(self, session, mission_id: str) -> list[MissionStepRecord]:
+        return list(
+            session.scalars(
+                select(MissionStepRecord).where(MissionStepRecord.mission_id == mission_id).order_by(MissionStepRecord.step_index)
+            ).all()
+        )
+
+    def _advance_mission(self, session, mission: MissionRecord, steps: list[MissionStepRecord]) -> bool:
+        """Process the mission's current step once.
+
+        Returns True when it made progress and the *next* current step should be
+        processed immediately in this same poll pass (a step reached a terminal
+        status, or a step transitioned into an active state that warrants an
+        immediate re-check). Returns False when the mission is finished or is
+        blocked waiting on the robot or a wall-clock timer — i.e. nothing more can
+        happen until a later poll.
+
+        Driving as far as possible per pass is what removes the poll-interval of
+        dead time that used to sit between every step transition.
+        """
+        current_step = next((step for step in steps if step.status not in FINAL_STEP_STATUSES), None)
+        if current_step is None:
+            return False
+
+        if current_step.status == MissionStepStatus.PENDING.value:
+            # Release this session's read transaction, then atomically claim the
+            # step. This both prevents a concurrent poller from dispatching the
+            # same step and avoids self-contention with the task INSERT during the
+            # (slow) move dispatch below.
+            session.commit()
+            if not self._claim_step(current_step.id):
+                # Another poller already owns this step; leave it to them.
+                return False
+            current_step.status = MissionStepStatus.RUNNING.value
+            try:
+                self._dispatch_step(mission, current_step)
+            except Exception as exc:
+                current_step.status = MissionStepStatus.FAILED.value
+                current_step.error_message = str(exc)
+                current_step.completed_at = utcnow()
+                mission.status = MissionStatus.FAILED.value
+                mission.error_message = str(exc)
+                return False
+            # A wait is now WAITING (re-check its timer immediately), an instant
+            # task is already terminal (advance), a move is RUNNING (re-check its
+            # task immediately). Keep going.
+            return True
+
+        if current_step.status == MissionStepStatus.WAITING.value:
+            self._handle_wait_step(mission, current_step)
+            return current_step.status in FINAL_STEP_STATUSES
+
+        if current_step.status == MissionStepStatus.RUNNING.value and not current_step.task_id:
+            # Claimed for dispatch but never linked to a task: recover it so a
+            # crashed poller can't strand the mission in RUNNING.
+            self._recover_orphaned_step(current_step)
+            return False
+
+        if current_step.status == MissionStepStatus.RUNNING.value and current_step.task_id:
+            task = self.task_manager.get_task(current_step.task_id)
+            current_step.compact_result = {"task": task}
+            current_step.updated_at = utcnow()
+            mission.updated_at = utcnow()
+            if task["status"] == TaskStatus.RUNNING.value:
+                mission.status = MissionStatus.RUNNING.value
+                return False
+            if task["status"] == TaskStatus.SUCCEEDED.value:
+                self._mark_step_complete(mission, current_step, MissionStepStatus.SUCCEEDED, result={"task": task})
+                mission.status = MissionStatus.RUNNING.value
+                return True
+            if task["status"] == TaskStatus.CANCELED.value:
+                self._mark_step_complete(mission, current_step, MissionStepStatus.CANCELED, result={"task": task}, error_message=task.get("error_message"))
+                mission.status = MissionStatus.CANCELED.value
+                mission.error_message = task.get("error_message") or "Mission step canceled."
+                mission.completed_at = utcnow()
+                return False
+            current_step.error_message = task.get("error_message") or "Mission step failed."
+            self._mark_step_complete(mission, current_step, MissionStepStatus.FAILED, result={"task": task}, error_message=current_step.error_message)
+            mission.status = MissionStatus.FAILED.value
+            mission.error_message = current_step.error_message
+            if self._maybe_replan(session, mission, steps, current_step):
+                # Replanning rewrote the remaining steps. Stop this pass and let
+                # the next poll dispatch the new plan, so each replan gets a real
+                # execution attempt instead of being re-evaluated (and possibly
+                # re-failed) synchronously within one pass.
+                mission.status = MissionStatus.RUNNING.value
+                return False
+            return False
+
+        return False
+
     def poll_missions(self) -> None:
         session = self.session_factory()
         try:
@@ -426,51 +568,28 @@ class MissionManager:
                 ).all()
             )
             for mission in missions:
-                steps = list(session.scalars(select(MissionStepRecord).where(MissionStepRecord.mission_id == mission.id).order_by(MissionStepRecord.step_index)).all())
-                current_step = next((step for step in steps if step.status not in FINAL_STEP_STATUSES), None)
-                if current_step is None:
-                    self._finalize_if_complete(mission)
-                    self._refresh_summary(mission, steps)
+                steps = self._load_steps(session, mission.id)
+                if not steps:
                     continue
+                # Advance the mission as far as it can go this pass. The bound is a
+                # safety backstop against an unexpected non-terminating transition:
+                # real progress is monotonic (steps reach terminal status or get
+                # dispatched at most once each, plus a bounded number of replans).
+                max_iterations = len(steps) * (self.settings.mission_max_replans + 2) + 4
+                for _ in range(max_iterations):
+                    if not self._advance_mission(session, mission, steps):
+                        break
+                    # Steps may have been mutated (replan deletes/adds rows), so
+                    # reload before selecting the next current step.
+                    steps = self._load_steps(session, mission.id)
 
-                if current_step.status == MissionStepStatus.PENDING.value:
-                    try:
-                        self._dispatch_step(mission, current_step)
-                    except Exception as exc:
-                        current_step.status = MissionStepStatus.FAILED.value
-                        current_step.error_message = str(exc)
-                        current_step.completed_at = utcnow()
-                        mission.status = MissionStatus.FAILED.value
-                        mission.error_message = str(exc)
-
-                elif current_step.status == MissionStepStatus.WAITING.value:
-                    self._handle_wait_step(mission, current_step)
-
-                elif current_step.status == MissionStepStatus.RUNNING.value and current_step.task_id:
-                    task = self.task_manager.get_task(current_step.task_id)
-                    current_step.compact_result = {"task": task}
-                    current_step.updated_at = utcnow()
-                    mission.updated_at = utcnow()
-                    if task["status"] == TaskStatus.RUNNING.value:
-                        mission.status = MissionStatus.RUNNING.value
-                    elif task["status"] == TaskStatus.SUCCEEDED.value:
-                        self._mark_step_complete(mission, current_step, MissionStepStatus.SUCCEEDED, result={"task": task})
-                        mission.status = MissionStatus.RUNNING.value
-                    elif task["status"] == TaskStatus.CANCELED.value:
-                        self._mark_step_complete(mission, current_step, MissionStepStatus.CANCELED, result={"task": task}, error_message=task.get("error_message"))
-                        mission.status = MissionStatus.CANCELED.value
-                        mission.error_message = task.get("error_message") or "Mission step canceled."
-                        mission.completed_at = utcnow()
-                    else:
-                        current_step.error_message = task.get("error_message") or "Mission step failed."
-                        self._mark_step_complete(mission, current_step, MissionStepStatus.FAILED, result={"task": task}, error_message=current_step.error_message)
-                        mission.status = MissionStatus.FAILED.value
-                        mission.error_message = current_step.error_message
-                        if self._maybe_replan(session, mission, steps, current_step):
-                            steps = list(session.scalars(select(MissionStepRecord).where(MissionStepRecord.mission_id == mission.id).order_by(MissionStepRecord.step_index)).all())
-                            mission.status = MissionStatus.RUNNING.value
-
-                if mission.status == MissionStatus.RUNNING.value and all(step.status in FINAL_STEP_STATUSES for step in steps):
+                # _advance may have mutated steps on the pass that returned False
+                # (e.g. a replan rewrites the remaining steps), so reload before
+                # settling the mission's final status against a fresh view.
+                steps = self._load_steps(session, mission.id)
+                if all(step.status in FINAL_STEP_STATUSES for step in steps) and mission.status not in FINAL_MISSION_STATUSES:
+                    # Every step settled with no forced FAILED/CANCELED -> mission
+                    # succeeded; _finalize relabels to CANCELED if it was soft-stopped.
                     self._finalize_if_complete(mission)
                 elif mission.status in {MissionStatus.FAILED.value, MissionStatus.CANCELED.value} and mission.completed_at is None:
                     mission.completed_at = utcnow()
