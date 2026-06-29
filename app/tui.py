@@ -6,18 +6,19 @@ Layout: a scrolling transcript (chat + tool-call trace), a live status bar
 (dry-run / e-stop / battery / move state), and an input line.
 
 Key safety behaviour:
-* ``Esc``        -> soft e-stop (``/api/estop?flag=true``) immediately.
-* ``Esc Esc``    -> PANIC: soft e-stop + cancel the active move.
-* Slash commands -> ``/dryrun on|off``, ``/status``, ``/markers``,
+* ``Esc``        -> graceful soft stop: let the current movement finish, then
+  run no more mission steps (does NOT halt mid-motion).
+* ``Esc Esc``    -> ask for confirmation, then a soft EMERGENCY stop
+  (``/api/estop?flag=true``) that free-stops the robot immediately.
+* Slash commands -> ``/dryrun on|off``, ``/status``, ``/markers``, ``/stop``,
   ``/release``, ``/help``, ``/quit``.
 
-The e-stop handler and status polling run off the UI thread, so e-stop fires
-instantly even while the model is still generating a reply.
+The stop handlers and status polling run off the UI thread, so they respond
+even while the model is still generating a reply.
 
 Note: the WATER API only exposes a *soft* e-stop. A true *hardware* hard-stop
 is the physical button on the robot and cannot be triggered from software
-(see API_EN.md s1.5); double-Esc therefore engages the strongest software
-action available (soft e-stop + cancel).
+(see API_EN.md s1.5).
 """
 
 from __future__ import annotations
@@ -64,8 +65,8 @@ HELP_LINES = [
     "  /quit              exit",
     "",
     "[b]Keys[/b]",
-    "  Esc                soft e-stop (immediate)",
-    "  Esc Esc            PANIC: soft e-stop + cancel active move",
+    "  Esc                graceful soft stop (finish current step, run no more)",
+    "  Esc Esc            confirm, then EMERGENCY stop (immediate free-stop)",
     "  PgUp / PgDn        scroll the transcript",
     "  Shift+↑ / Shift+↓  scroll the transcript one line",
     "",
@@ -376,6 +377,7 @@ try:  # Import lazily so `import app.tui` doesn't hard-require textual for tests
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
+    from textual.screen import ModalScreen
     from textual.widgets import Footer, Header, Input, RichLog, Static
 
     _TEXTUAL_AVAILABLE = True
@@ -384,6 +386,35 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only without textual
 
 
 if _TEXTUAL_AVAILABLE:
+
+    class ConfirmEstopScreen(ModalScreen[bool]):
+        """Confirm before firing the immediate emergency stop (double-Esc)."""
+
+        CSS = """
+        ConfirmEstopScreen { align: center middle; background: $background 60%; }
+        #estop-confirm { width: 60; height: auto; border: thick $error; background: $surface; padding: 1 2; }
+        """
+
+        BINDINGS = [
+            Binding("y", "confirm", "E-STOP", priority=True),
+            Binding("enter", "confirm", "E-STOP", priority=True),
+            Binding("escape", "cancel", "Cancel", priority=True),
+            Binding("n", "cancel", "Cancel", priority=True),
+        ]
+
+        def compose(self) -> ComposeResult:
+            yield Static(
+                "[b red]⚠ EMERGENCY STOP[/b red]\n\n"
+                "Immediately free-stop the robot?\n\n"
+                "[b]Y[/b] / [b]Enter[/b] = e-stop      [b]Esc[/b] / [b]N[/b] = cancel",
+                id="estop-confirm",
+            )
+
+        def action_confirm(self) -> None:
+            self.dismiss(True)
+
+        def action_cancel(self) -> None:
+            self.dismiss(False)
 
     class AlexAgentTUI(App):
         CSS = """
@@ -398,7 +429,7 @@ if _TEXTUAL_AVAILABLE:
         """
 
         BINDINGS = [
-            Binding("escape", "estop", "E-STOP", priority=True, show=True),
+            Binding("escape", "estop", "Soft stop (2×=E-STOP)", priority=True, show=True),
             Binding("ctrl+c", "quit", "Quit", priority=True, show=True),
             # Scroll the transcript (works even when the input has focus).
             # Plain up/down matters for Terminal.app, whose "Scroll alternate
@@ -417,6 +448,7 @@ if _TEXTUAL_AVAILABLE:
             super().__init__()
             self.ctl = console
             self._last_esc = 0.0
+            self._confirming = False
             self._busy = False
             self._spin = 0
             self._think_start = 0.0
@@ -441,7 +473,7 @@ if _TEXTUAL_AVAILABLE:
             self.status_widget = self.query_one("#status", Static)
             self.thinking_widget = self.query_one("#thinking", Static)
             self.ctx_widget = self.query_one("#ctx", Static)
-            self._write("[dim]Connected. Type a message or /help. Esc = soft e-stop.[/dim]")
+            self._write("[dim]Connected. Type a message or /help. Esc = soft stop · double-Esc = emergency stop.[/dim]")
             mode = "ON (simulated)" if self.ctl.dry_run else f"OFF — LIVE -> {self.ctl.live_target}"
             self._write(f"[dim]dry-run is {mode}[/dim]")
             self.query_one("#prompt", Input).focus()
@@ -510,12 +542,27 @@ if _TEXTUAL_AVAILABLE:
                 self.log_widget.scroll_up(animate=False)
             event.stop()
 
-        # ----- e-stop ----------------------------------------------------- #
+        # ----- stop actions ----------------------------------------------- #
         def action_estop(self) -> None:
+            # Single Esc -> graceful soft stop. Double Esc -> confirm, then a
+            # real immediate emergency stop.
+            if self._confirming:
+                return  # the confirmation modal owns the keyboard
             now = time.monotonic()
-            panic = (now - self._last_esc) <= self.DOUBLE_ESC_WINDOW
+            double = (now - self._last_esc) <= self.DOUBLE_ESC_WINDOW
             self._last_esc = now
-            self._estop_worker(panic)
+            if double:
+                self._confirming = True
+                self.push_screen(ConfirmEstopScreen(), self._on_estop_confirmed)
+            else:
+                self._soft_stop_worker()
+
+        def _on_estop_confirmed(self, confirmed: bool | None) -> None:
+            self._confirming = False
+            if confirmed:
+                self._estop_worker()
+            else:
+                self._write("[dim]emergency stop canceled[/dim]")
 
         # ----- workers (run off the UI thread) ---------------------------- #
         @work(thread=True, group="chat")
@@ -541,13 +588,27 @@ if _TEXTUAL_AVAILABLE:
                 self.call_from_thread(self._set_idle)
 
         @work(thread=True, group="estop")
-        def _estop_worker(self, panic: bool) -> None:
+        def _soft_stop_worker(self) -> None:
+            try:
+                report = self.ctl.soft_stop()
+            except Exception as exc:  # noqa: BLE001
+                self.call_from_thread(self._write, f"[red]soft stop error:[/red] {exc}")
+                return
+            if report.get("stopped"):
+                tail = " — finishing the current step" if report.get("finishing_current_step") else ""
+                msg = (
+                    f"[yellow]⏸ soft stop{tail}: canceled {report['canceled_pending_steps']} "
+                    f"upcoming step(s); the robot won't start another.[/yellow]"
+                )
+            else:
+                msg = "[dim]soft stop: nothing running to stop. Double-Esc to emergency-stop.[/dim]"
+            self.call_from_thread(self._write, msg)
+
+        @work(thread=True, group="estop")
+        def _estop_worker(self) -> None:
             try:
                 self.ctl.soft_estop()
-                msg = "[b red]🛑 SOFT E-STOP engaged[/b red]"
-                if panic:
-                    self.ctl.cancel_active_move()
-                    msg = "[b red]🛑🛑 PANIC — soft e-stop + cancelled active move[/b red]"
+                msg = "[b red]🛑 EMERGENCY STOP engaged (soft e-stop)[/b red]"
             except Exception as exc:  # noqa: BLE001
                 msg = f"[red]e-stop error:[/red] {exc}"
             self.call_from_thread(
@@ -601,7 +662,7 @@ if _TEXTUAL_AVAILABLE:
                 frame = SPINNER[self._spin % len(SPINNER)]
                 self._spin += 1
                 elapsed = time.monotonic() - self._think_start
-                self.thinking_widget.update(f"{frame} Thinking… ({elapsed:.0f}s)  [dim]· Esc to e-stop[/dim]")
+                self.thinking_widget.update(f"{frame} Thinking… ({elapsed:.0f}s)  [dim]· Esc soft-stop[/dim]")
                 self._thinking_shown = True
             elif self._thinking_shown:
                 self.thinking_widget.update("")
