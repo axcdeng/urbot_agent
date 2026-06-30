@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from app.agent.mission_planner import MissionPlanner
 from app.agent.llm_client import LLMClient
@@ -60,7 +60,16 @@ class AgentPlanner:
         message: str,
         history: list[dict[str, Any]] | None = None,
         summary: str | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        # on_event (optional) streams the turn as it happens: a {"type": ...}
+        # event per narration / tool call / tool result, so the UI can render
+        # live instead of waiting for the whole turn. None -> silent (tests,
+        # offline/JSON-fallback paths).
+        def emit(event: dict[str, Any]) -> None:
+            if on_event is not None:
+                on_event(event)
+
         # Let create_mission record the originating request.
         self.tool_registry.current_message = message
 
@@ -92,7 +101,13 @@ class AgentPlanner:
         messages.extend(history or [])
         messages.append({"role": "user", "content": message})
 
-        for _ in range(4):
+        # Cap the number of rounds that actually DO something (read/move/mission)
+        # so a turn can't loop forever; status_update rounds are pure narration
+        # and don't count against the budget.
+        action_iterations = 0
+        total_rounds = 0
+        while action_iterations < 4 and total_rounds < 8:
+            total_rounds += 1
             try:
                 response = self.llm_client.chat_with_tools(messages, self.tool_registry.definitions())
             except Exception:
@@ -110,6 +125,7 @@ class AgentPlanner:
                     "created_task_ids": created_task_ids,
                     "created_mission_ids": created_mission_ids,
                     "final_robot_state": self.state_manager.get_compact_robot_state(),
+                    "streamed": on_event is not None,
                 }
 
             messages.append(
@@ -120,11 +136,29 @@ class AgentPlanner:
                 }
             )
 
+            did_action = False
             for tool_call in tool_calls:
                 function = tool_call.get("function", {})
                 name = function.get("name")
                 arguments = function.get("arguments") or "{}"
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+
+                if name == "status_update":
+                    # Narration only: surface to the user, ack to the model, and
+                    # do NOT record it as a tool call or count it as an action.
+                    emit({"type": "narration", "text": str(parsed_arguments.get("message", "")).strip()})
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", name),
+                            "name": name,
+                            "content": json.dumps({"ack": True}),
+                        }
+                    )
+                    continue
+
+                did_action = True
+                emit({"type": "tool_call", "name": name, "arguments": parsed_arguments})
                 try:
                     execution = self.tool_registry.execute(name, parsed_arguments)
                     payload = execution.payload
@@ -132,6 +166,7 @@ class AgentPlanner:
                     created_mission_ids.extend(execution.mission_ids)
                 except Exception as exc:  # surface tool errors back to the model instead of aborting
                     payload = {"error": str(exc)}
+                emit({"type": "tool_result", "name": name, "payload": payload})
                 tool_calls_used.append({"name": name, "arguments": parsed_arguments, "payload": payload})
                 messages.append(
                     {
@@ -142,12 +177,16 @@ class AgentPlanner:
                     }
                 )
 
+            if did_action:
+                action_iterations += 1
+
         return {
             "assistant_response": "Reached the tool execution limit for this turn.",
             "tool_calls": tool_calls_used,
             "created_task_ids": created_task_ids,
             "created_mission_ids": created_mission_ids,
             "final_robot_state": self.state_manager.get_compact_robot_state(),
+            "streamed": on_event is not None,
         }
 
     def _run_offline(self, message: str) -> dict[str, Any]:

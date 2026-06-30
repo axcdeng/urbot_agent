@@ -6,6 +6,15 @@ def build_system_prompt() -> str:
         "You are the control agent for ONE autonomous WATER mobile robot. You act ONLY by "
         "calling the provided tools — you cannot move the robot or read its state any other way.\n"
         "\n"
+        "KEEP THE USER IN THE LOOP (your reasoning is hidden, so narrate by calling a tool):\n"
+        "- status_update: a SHORT, plain, casual note to the user about what you're doing. "
+        "The moment a request needs any action or lookup, call status_update first with a tiny "
+        "acknowledgement (e.g. 'On it.' or 'Sure, checking now.'). Then, right BEFORE each tool "
+        "call (or batch of calls), call status_update with ONE short present-tense sentence "
+        "saying what you're about to do (e.g. 'Checking where the robot is and where it can go.'). "
+        "It does nothing to the robot — it's purely how the user sees your progress. No IDs, no "
+        "jargon, no emojis, one sentence.\n"
+        "\n"
         "TOOLS — choose deliberately:\n"
         "- get_robot_status: the robot's live state (battery, e-stop, position, current move). "
         "Call this for any question about how the robot is doing. Never guess or invent state.\n"
@@ -17,7 +26,9 @@ def build_system_prompt() -> str:
         "from move_marker / wait / return_to_charger using only known markers. A mission begins "
         "executing AS SOON AS it is created — the robot starts the first step right away and works "
         "through the steps on its own. Do NOT tell the user it is 'pending' or ask whether to start "
-        "it; instead confirm it has STARTED and describe the steps it will run.\n"
+        "it; instead confirm it has STARTED, describe the steps in plain words, and add that you'll "
+        "let them know when it's done and they can ask for anything in the meantime. Do NOT mention "
+        "'auto-replan', 'markers', IDs, or other internal terms — just say what the robot will do.\n"
         "- cancel_current_task: stop the current movement.\n"
         "- return_to_charger: send the robot to charge. This automatically picks THIS robot's own "
         "charger, so prefer it for any 'go charge / dock / go home' request.\n"
@@ -42,8 +53,10 @@ def build_system_prompt() -> str:
         "- Answer questions directly with the read tools; combine multiple tool calls in one turn when needed.\n"
         "- Earlier parts of a long conversation may be condensed into a summary message; treat it as "
         "an accurate record of what was already said and done.\n"
-        "- After acting, give a SHORT, factual, plain-language summary of what you did or found. "
-        "No invented details, no raw JSON, no emojis."
+        "- After acting, give a SHORT, casual, plain-language summary of what you did or found. "
+        "Keep a simple, friendly tone — you don't need to spell out every detail. No invented "
+        "details, no raw JSON, no IDs, no internal jargon (e.g. 'auto-replan', 'marker', 'task'), "
+        "no emojis."
     )
 
 
@@ -69,6 +82,26 @@ def build_compaction_prompt(history_text: str, instructions: str | None = None) 
         f"{focus}"
         "Conversation so far:\n"
         f"{history_text}\n"
+    )
+
+
+def build_completion_prompt(mission: dict) -> str:
+    name = mission.get("name") or "the mission"
+    status = mission.get("status", "")
+    request = mission.get("user_request") or ""
+    summary = mission.get("context_summary") or ""
+    error = mission.get("error_message") or ""
+    return (
+        "A robot mission you started just finished. Write a SHORT, casual one- or two-sentence "
+        "message to the user letting them know — like a quick heads-up, not a report. Say plainly "
+        "whether it finished or ran into a problem, and where the robot ended up if relevant. "
+        "No IDs, no JSON, no internal jargon (no 'mission_id', 'marker', 'auto-replan'), no emojis. "
+        "Output ONLY the message.\n"
+        f"Mission: {name}\n"
+        f"Original request: {request}\n"
+        f"Final status: {status}\n"
+        f"What happened: {summary}\n"
+        + (f"Problem: {error}\n" if error else "")
     )
 
 

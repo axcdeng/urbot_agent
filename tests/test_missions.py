@@ -333,3 +333,30 @@ def test_compact_summary_rolls_up_older_completed_steps(tmp_path: Path):
     result = mission_manager.get_mission(mission["mission_id"])
     assert result["status"] == "succeeded"
     assert "Earlier completed steps" in (result["context_summary"] or "")
+
+
+def test_drain_finalized_reports_completion_once(tmp_path: Path):
+    """A mission that finishes is reported by drain_finalized exactly once."""
+    mission_manager, task_manager, _ = build_mission_manager(tmp_path)
+    mission = mission_manager.create_mission(
+        user_request="Run two fast steps",
+        steps=[{"step_type": "cancel_move", "description": f"Cancel {idx}"} for idx in range(2)],
+        auto_replan=False,
+    )
+    mission_id = mission["mission_id"]
+
+    # Nothing has finished yet.
+    assert mission_manager.drain_finalized() == []
+
+    for _ in range(6):
+        task_manager.poll_active_tasks()
+        mission_manager.poll_missions()
+    assert mission_manager.get_mission(mission_id)["status"] == "succeeded"
+
+    finished = mission_manager.drain_finalized()
+    assert [m["mission_id"] for m in finished] == [mission_id]
+    assert finished[0]["status"] == "succeeded"
+    # Draining is one-shot: a second drain (and further polls) reports nothing.
+    assert mission_manager.drain_finalized() == []
+    mission_manager.poll_missions()
+    assert mission_manager.drain_finalized() == []

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from app.config import Settings
@@ -5,15 +6,37 @@ from app.main import build_services
 from app.tui import AgentConsole
 
 
+def _scripted_llm(console: AgentConsole, responses: list[dict]) -> None:
+    """Make the agent's tool-calling LLM return a fixed sequence of responses,
+    and stub the plain-text completion (titles/summaries) so nothing hits the
+    network."""
+    calls = {"i": 0}
+
+    def fake_chat_with_tools(messages, tools):
+        response = responses[calls["i"]]
+        calls["i"] += 1
+        return response
+
+    console.services.llm_client.chat_with_tools = fake_chat_with_tools  # type: ignore[method-assign]
+    console.services.llm_client.complete = lambda *a, **k: ""  # type: ignore[method-assign]
+
+
+def _assistant_turn(content: str, tool_calls: list[tuple] | None = None) -> dict:
+    calls = []
+    for i, (name, args) in enumerate(tool_calls or []):
+        calls.append({"id": f"c{i}", "function": {"name": name, "arguments": json.dumps(args)}})
+    return {"choices": [{"message": {"content": content, "tool_calls": calls}}]}
+
+
 def build_console(tmp_path: Path, **overrides) -> AgentConsole:
-    settings = Settings(
+    kwargs = dict(
         database_url=f"sqlite:///{tmp_path / 'tui.db'}",
         water_dry_run=True,
         llm_enabled=False,
         llm_dry_run=True,
-        **overrides,
     )
-    return AgentConsole(build_services(settings))
+    kwargs.update(overrides)
+    return AgentConsole(build_services(Settings(**kwargs)))
 
 
 def test_dryrun_toggle(tmp_path: Path):
@@ -165,3 +188,41 @@ def test_compact_current_offline(tmp_path: Path):
         console.chat(f"message {i}")
     report = console.compact_current()
     assert report["compacted"] is True
+
+
+def test_chat_streams_events_and_status_update_is_narration_not_a_tool(tmp_path: Path):
+    console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
+    _scripted_llm(console, [
+        _assistant_turn("", [
+            ("status_update", {"message": "On it."}),
+            ("get_robot_status", {}),
+        ]),
+        _assistant_turn("Battery looks fine.", []),
+    ])
+
+    events: list[dict] = []
+    result = console.chat("how's the battery", on_event=events.append)
+
+    # status_update -> narration (rendered live); the real tool -> call + result.
+    assert [e["type"] for e in events] == ["narration", "tool_call", "tool_result"]
+    assert events[0]["text"] == "On it."
+    assert events[1]["name"] == "get_robot_status"
+    assert result["assistant_response"] == "Battery looks fine."
+    assert result["streamed"] is True
+    # status_update performs no action, so it is NOT recorded as a tool call.
+    assert [c["name"] for c in result["tool_calls"]] == ["get_robot_status"]
+
+
+def test_status_only_rounds_do_not_exhaust_the_action_budget(tmp_path: Path):
+    console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
+    # Five pure-narration rounds must not burn the 4-action budget; the real
+    # action and final reply still land.
+    status_round = _assistant_turn("", [("status_update", {"message": "working"})])
+    _scripted_llm(console, [status_round] * 5 + [
+        _assistant_turn("", [("get_robot_status", {})]),
+        _assistant_turn("done", []),
+    ])
+
+    result = console.chat("status please")
+    assert result["assistant_response"] == "done"
+    assert [c["name"] for c in result["tool_calls"]] == ["get_robot_status"]

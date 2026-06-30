@@ -41,6 +41,26 @@ class AgentToolRegistry:
             {
                 "type": "function",
                 "function": {
+                    "name": "status_update",
+                    "description": (
+                        "Tell the user, in ONE short plain present-tense sentence, what you are "
+                        "about to do — call this RIGHT BEFORE the tool call(s) it describes (and "
+                        "once at the very start of a turn to acknowledge, e.g. 'On it.'). This is "
+                        "the only way the user sees what you're doing, since your reasoning is "
+                        "hidden. It performs no robot action. Keep it casual; no IDs, no jargon, "
+                        "no emojis."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "get_robot_status",
                     "description": "Get a compact summary of the robot state.",
                     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -87,7 +107,8 @@ class AgentToolRegistry:
                         "Create a durable, ordered multi-step mission. Use this whenever the user "
                         "asks for a SEQUENCE of actions (e.g. go somewhere, wait, then go elsewhere, "
                         "then return to charger) instead of issuing several move_to_location calls. "
-                        "Missions persist and auto-replan. Use only known markers/aliases. "
+                        "Missions are durable and recover on their own if a step fails. Use only "
+                        "known markers/aliases. "
                         "IMPORTANT: a mission STARTS RUNNING the moment it is created — the robot "
                         "begins the first step immediately. There is no separate 'start' action and "
                         "you do NOT need to ask the user whether to begin."
@@ -180,6 +201,10 @@ class AgentToolRegistry:
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolExecution:
+        if name == "status_update":
+            # Narration only: surfaced to the user by the planner's event stream;
+            # performs no robot action and returns a trivial ack to the model.
+            return ToolExecution(content="ok", task_ids=[], payload={"ack": True})
         if name == "get_robot_status":
             payload = self.state_manager.get_compact_robot_state()
             return ToolExecution(content="Robot status fetched.", task_ids=[], payload=payload)

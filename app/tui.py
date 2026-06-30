@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.agent.prompts import build_completion_prompt
 from app.config import get_settings
 from app.main import ServiceContainer, build_services
 from app.robot.profiles import ROBOT_PROFILES
@@ -88,6 +89,9 @@ class AgentConsole:
         # /chats + /open. (Not auto-resuming is deliberate — it's why a restart
         # no longer drags an old conversation/mission back into context.)
         self.current_session_id = services.conversation_manager.create_session()
+        # Missions dispatched during THIS run — so completion notices only fire
+        # for missions the user actually started here (not stale DB history).
+        self._session_mission_ids: set[str] = set()
 
     @property
     def convo(self):
@@ -140,11 +144,14 @@ class AgentConsole:
         loaded = self.services.location_registry.load_marker_map(profile.markers)
         return len(loaded)
 
-    def chat(self, message: str) -> dict[str, Any]:
+    def chat(self, message: str, on_event=None) -> dict[str, Any]:
         llm = self.services.llm_client
         llm.reset_metrics()
         summary, history = self.convo.build_history(self.current_session_id)
-        result = self.services.agent_planner.run_chat(message, history=history, summary=summary)
+        result = self.services.agent_planner.run_chat(
+            message, history=history, summary=summary, on_event=on_event
+        )
+        self._session_mission_ids.update(result.get("created_mission_ids") or [])
         # Snapshot the answer's metrics BEFORE the title/compaction calls below
         # (they reuse the same LLM client and would otherwise inflate the numbers
         # shown for this turn).
@@ -239,6 +246,31 @@ class AgentConsole:
     def poll(self) -> None:
         self.services.task_manager.poll_active_tasks()
         self.services.mission_manager.poll_missions()
+
+    def drain_completions(self) -> list[dict[str, Any]]:
+        """Missions that finished since the last check, limited to ones started
+        in this run. Each is returned once."""
+        finished = self.services.mission_manager.drain_finalized()
+        return [m for m in finished if m.get("mission_id") in self._session_mission_ids]
+
+    def summarize_completion(self, mission: dict[str, Any]) -> str:
+        """A short, plain 'mission done' line for the user. Asks the model for a
+        casual sentence; falls back to a simple template when the LLM is
+        off/dry-run (model returns an empty string)."""
+        try:
+            text = self.services.llm_client.complete(build_completion_prompt(mission), max_tokens=120)
+        except Exception:  # noqa: BLE001 - never let a notice crash polling
+            text = ""
+        text = (text or "").strip()
+        if text:
+            return text
+        name = mission.get("name") or "the mission"
+        if mission.get("status") == "succeeded":
+            return f"All done — {name} finished."
+        if mission.get("status") == "canceled":
+            return f"Stopped {name} as you asked."
+        problem = mission.get("error_message") or "it ran into a problem"
+        return f"{name} didn't finish — {problem}."
 
     # ----- slash commands ------------------------------------------------- #
     def run_command(self, line: str) -> CommandResult:
@@ -452,8 +484,17 @@ if _TEXTUAL_AVAILABLE:
             self._busy = False
             self._spin = 0
             self._think_start = 0.0
+            # Start of the CURRENT thinking spell. Reset after each narration /
+            # tool line so the live "Thinking…" counter restarts (Claude-Code
+            # style); a spell over 30s leaves a grey "Thought for Ns" trace.
+            self._segment_start = 0.0
             self._thinking_shown = False
             self._stop = threading.Event()
+            # "Mission done" notices queued from the background poll thread,
+            # delivered only while idle so they never interleave with a turn.
+            self._completion_queue: list[dict[str, Any]] = []
+            self._completion_lock = threading.Lock()
+            self._delivering_completion = False
 
         # ----- layout ----------------------------------------------------- #
         def compose(self) -> ComposeResult:
@@ -499,7 +540,7 @@ if _TEXTUAL_AVAILABLE:
                     instructions = body[len("compact"):].strip() or None
                     self._write("[yellow]🗜 Compacting conversation…[/yellow]")
                     self._busy = True
-                    self._think_start = time.monotonic()
+                    self._think_start = self._segment_start = time.monotonic()
                     self._compact_worker(instructions)
                     return
                 result = self.ctl.run_command(text)
@@ -515,7 +556,7 @@ if _TEXTUAL_AVAILABLE:
                 return
             self._write(f"[b cyan]you[/b cyan] {text}")
             self._busy = True
-            self._think_start = time.monotonic()
+            self._think_start = self._segment_start = time.monotonic()
             self._chat_worker(text)
 
         # ----- scrolling --------------------------------------------------- #
@@ -567,8 +608,13 @@ if _TEXTUAL_AVAILABLE:
         # ----- workers (run off the UI thread) ---------------------------- #
         @work(thread=True, group="chat")
         def _chat_worker(self, message: str) -> None:
+            def on_event(event: dict[str, Any]) -> None:
+                # Hop back to the UI thread to render each event the moment it
+                # happens (narration / tool call / tool result).
+                self.call_from_thread(self._on_agent_event, event)
+
             try:
-                result = self.ctl.chat(message)
+                result = self.ctl.chat(message, on_event=on_event)
             except Exception as exc:  # noqa: BLE001
                 self.call_from_thread(self._write, f"[red]chat failed:[/red] {exc}")
             else:
@@ -624,12 +670,43 @@ if _TEXTUAL_AVAILABLE:
             while not self._stop.is_set():
                 try:
                     self.ctl.poll()
+                    finished = self.ctl.drain_completions()
+                    if finished:
+                        with self._completion_lock:
+                            self._completion_queue.extend(finished)
+                    self.call_from_thread(self._maybe_deliver_completion)
                 except Exception:  # noqa: BLE001 - polling is best-effort
                     pass
                 self._stop.wait(2.0)
 
         def on_unmount(self) -> None:
             self._stop.set()
+
+        def _maybe_deliver_completion(self) -> None:
+            # Deliver one queued "mission done" notice at a time, and only while
+            # idle, so it never interleaves with a chat turn the user is running.
+            if self._busy or self._delivering_completion:
+                return
+            with self._completion_lock:
+                if not self._completion_queue:
+                    return
+                mission = self._completion_queue.pop(0)
+            self._delivering_completion = True
+            self._completion_worker(mission)
+
+        @work(thread=True, group="completion")
+        def _completion_worker(self, mission: dict[str, Any]) -> None:
+            try:
+                text = self.ctl.summarize_completion(mission)
+            except Exception as exc:  # noqa: BLE001
+                text = f"(couldn't summarize a finished mission: {exc})"
+            self.call_from_thread(self._write, f"[b green]agent[/b green] {text}")
+            self.call_from_thread(self._completion_done)
+
+        def _completion_done(self) -> None:
+            # Drain the next queued notice (if any) now that this one is shown.
+            self._delivering_completion = False
+            self._maybe_deliver_completion()
 
         @work(thread=True, group="status", exclusive=True)
         def _refresh(self) -> None:
@@ -661,8 +738,11 @@ if _TEXTUAL_AVAILABLE:
             if self._busy:
                 frame = SPINNER[self._spin % len(SPINNER)]
                 self._spin += 1
-                elapsed = time.monotonic() - self._think_start
-                self.thinking_widget.update(f"{frame} Thinking… ({elapsed:.0f}s)  [dim]· Esc soft-stop[/dim]")
+                # Count from the current spell, which restarts after each
+                # narration / tool line (so the timer reflects "since last
+                # output", Claude-Code style).
+                elapsed = time.monotonic() - self._segment_start
+                self.thinking_widget.update(f"{frame} ✻ Thinking… ({elapsed:.0f}s)  [dim]· Esc soft-stop[/dim]")
                 self._thinking_shown = True
             elif self._thinking_shown:
                 self.thinking_widget.update("")
@@ -672,10 +752,58 @@ if _TEXTUAL_AVAILABLE:
         def _write(self, renderable: Any) -> None:
             self.log_widget.write(renderable)
 
+        def _reset_think_segment(self) -> None:
+            # End the current thinking spell. If it ran long, leave a permanent
+            # grey trace in the transcript; then start a fresh spell so the live
+            # counter restarts from 0 for whatever the agent does next.
+            now = time.monotonic()
+            elapsed = now - self._segment_start
+            if self._busy and elapsed > 30:
+                self._write(f"[dim]Thought for {elapsed:.0f}s[/dim]")
+            self._segment_start = now
+
         def _set_idle(self) -> None:
+            # Close out the final spell (may leave a "Thought for Ns" trace),
+            # then clear the live indicator.
+            self._reset_think_segment()
             self._busy = False
             self.thinking_widget.update("")
             self._thinking_shown = False
+            # A mission may have finished while the user was mid-turn; now idle,
+            # deliver any queued completion notice.
+            self._maybe_deliver_completion()
+
+        def _on_agent_event(self, event: dict[str, Any]) -> None:
+            # Render a single streamed event the moment it happens, then restart
+            # the thinking spell so the live counter resets for the next step.
+            kind = event.get("type")
+            if kind == "narration":
+                text = event.get("text", "")
+                if text:
+                    self._write(f"[b green]agent[/b green] {text}")
+            elif kind == "tool_call":
+                self._write_tool_call(event.get("name"), event.get("arguments"))
+            elif kind == "tool_result":
+                self._write_tool_detail(event.get("payload"))
+            self._reset_think_segment()
+
+        def _write_tool_call(self, name: Any, args: Any) -> None:
+            self._write(f"  [magenta]🔧 {name}[/magenta]([cyan]{_format_args(args)}[/cyan])")
+
+        def _write_tool_detail(self, payload: Any) -> None:
+            payload = payload or {}
+            outcome = payload.get("error_message") or payload.get("status")
+            target = payload.get("requested_target") or payload.get("marker_name")
+            task_id = payload.get("task_id")
+            detail = " · ".join(
+                p for p in (
+                    f"target={target}" if target else "",
+                    f"task={task_id[:8]}" if task_id else "",
+                    str(outcome) if outcome else "",
+                ) if p
+            )
+            if detail:
+                self._write(f"     [dim]→ {detail}[/dim]")
 
         def _render_compact(self, report: dict[str, Any]) -> None:
             if report.get("compacted"):
@@ -688,27 +816,19 @@ if _TEXTUAL_AVAILABLE:
                 self._write(f"[dim]nothing to compact ({report.get('reason', 'n/a')})[/dim]")
 
         def _render_result(self, result: dict[str, Any]) -> None:
-            for call in result.get("tool_calls", []):
-                name = call.get("name")
-                args = call.get("arguments")
-                arg_str = _format_args(args)
-                self._write(f"  [magenta]🔧 {name}[/magenta]([cyan]{arg_str}[/cyan])")
-                payload = call.get("payload") or {}
-                outcome = payload.get("error_message") or payload.get("status")
-                target = payload.get("requested_target") or payload.get("marker_name")
-                task_id = payload.get("task_id")
-                detail = " · ".join(
-                    p for p in (
-                        f"target={target}" if target else "",
-                        f"task={task_id[:8]}" if task_id else "",
-                        str(outcome) if outcome else "",
-                    ) if p
-                )
-                if detail:
-                    self._write(f"     [dim]→ {detail}[/dim]")
-            for mission_id in result.get("created_mission_ids", []):
-                self._write(f"  [blue]＋ mission {mission_id[:8]}[/blue]")
-            self._write(f"[b green]agent[/b green] {result.get('assistant_response', '')}")
+            # When the turn was streamed, its tool calls / details were already
+            # rendered live by _on_agent_event — only finalize here (final reply,
+            # compaction notice, metrics). The non-streamed path renders the
+            # whole batch.
+            if not result.get("streamed"):
+                for call in result.get("tool_calls", []):
+                    self._write_tool_call(call.get("name"), call.get("arguments"))
+                    self._write_tool_detail(call.get("payload"))
+                for mission_id in result.get("created_mission_ids", []):
+                    self._write(f"  [blue]＋ mission {mission_id[:8]}[/blue]")
+            response = result.get("assistant_response", "")
+            if response:
+                self._write(f"[b green]agent[/b green] {response}")
             auto = result.get("auto_compacted")
             if auto and auto.get("compacted"):
                 was = int(round(auto.get("before_fraction", 0) * 100))

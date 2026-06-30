@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -95,6 +96,12 @@ class MissionManager:
         # no schema change; the stop *behavior* is persisted via the canceled
         # steps, only the cosmetic label depends on this.
         self._soft_stopped: set[str] = set()
+        # Missions that reached a terminal status during polling, awaiting a
+        # user-facing "mission done" message. Drained by the UI. Guarded by a
+        # lock because polling runs on a background thread while drain_finalized
+        # is called from another.
+        self._finalized: list[dict[str, Any]] = []
+        self._finalized_lock = threading.Lock()
         # A step claimed for dispatch but never linked to a task is "in flight"
         # only briefly (bounded by the move HTTP timeout). Past this grace period
         # we treat it as orphaned by a crashed poller and recover it. Kept well
@@ -595,9 +602,33 @@ class MissionManager:
                     mission.completed_at = utcnow()
 
                 self._refresh_summary(mission, steps)
+                # Only non-terminal missions are selected above, so any mission
+                # now in a terminal status just transitioned this pass -> record
+                # it once for the UI's "mission done" message.
+                if mission.status in FINAL_MISSION_STATUSES:
+                    self._record_finalized(mission)
             session.commit()
         finally:
             session.close()
+
+    def _record_finalized(self, mission: MissionRecord) -> None:
+        record = {
+            "mission_id": mission.id,
+            "name": mission.name,
+            "user_request": mission.user_request,
+            "status": mission.status,
+            "error_message": mission.error_message,
+            "context_summary": mission.context_summary,
+        }
+        with self._finalized_lock:
+            self._finalized.append(record)
+
+    def drain_finalized(self) -> list[dict[str, Any]]:
+        """Return missions that finished since the last drain, and clear them."""
+        with self._finalized_lock:
+            items = self._finalized
+            self._finalized = []
+        return items
 
     async def start_polling(self) -> None:
         if self._polling_task is not None:
