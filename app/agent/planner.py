@@ -5,7 +5,12 @@ from typing import Any, Callable
 
 from app.agent.mission_planner import MissionPlanner
 from app.agent.llm_client import LLMClient
-from app.agent.prompts import build_json_fallback_prompt, build_runtime_context, build_system_prompt
+from app.agent.prompts import (
+    build_json_fallback_prompt,
+    build_narration_prompt,
+    build_runtime_context,
+    build_system_prompt,
+)
 from app.agent.tools import AgentToolRegistry
 from app.robot.locations import LocationRegistry
 from app.robot.mission_manager import MissionManager
@@ -91,6 +96,24 @@ class AgentPlanner:
                 for mission in missions
             ]
         }
+
+    def _model_narration(self, message: str, action_calls: list[tuple]) -> str | None:
+        """Ask the model for a one-line 'what I'm about to do' update, with Qwen
+        thinking turned off so it stays fast. Returns None on any failure (the
+        caller then falls back to a deterministic template), so a slow or down
+        model never blocks the turn for long."""
+        descriptions = "; ".join(_describe_action(name, args) for _tc, name, args in action_calls)
+        try:
+            text = self.llm_client.complete(
+                build_narration_prompt(message, descriptions), max_tokens=60, timeout=20.0
+            )
+        except Exception:  # noqa: BLE001 - narration is best-effort; fall back
+            return None
+        if not text:
+            return None
+        # Keep just the first line and strip any stray quotes the model adds.
+        line = text.strip().splitlines()[0].strip().strip('"').strip()
+        return line or None
 
     def run_chat(
         self,
@@ -198,7 +221,11 @@ class AgentPlanner:
                 for text in narrations:
                     emit({"type": "narration", "text": text})
             elif action_calls:
-                emit({"type": "narration", "text": _narrate_actions(action_calls)})
+                # Blocking: generate the update line and emit it BEFORE any
+                # tool-call event, so the tool call never appears ahead of the
+                # message describing it (a little latency is acceptable).
+                text = self._model_narration(message, action_calls) if on_event is not None else None
+                emit({"type": "narration", "text": text or _narrate_actions(action_calls)})
 
             did_action = False
             for tool_call, name, parsed_arguments in parsed:

@@ -126,12 +126,15 @@ class LLMClient:
         content = data["choices"][0]["message"].get("content", "{}")
         return extract_json_object(content)
 
-    def complete(self, prompt: str, max_tokens: int | None = None) -> str:
-        """Plain-text completion for short utilities (chat titles, summaries).
+    def complete(self, prompt: str, max_tokens: int | None = None, timeout: float | None = None) -> str:
+        """Plain-text completion for short utilities (chat titles, summaries,
+        the pre-tool update line).
 
         Returns the assistant text with any <think> reasoning block stripped.
         Raises WaterClientError on transport failure; callers fall back when the
-        LLM is disabled/dry-run (both return an empty string here).
+        LLM is disabled/dry-run (both return an empty string here). Pass a short
+        ``timeout`` for latency-sensitive calls so a slow model fails fast and
+        the caller can fall back.
         """
         if not self.settings.llm_enabled or self.settings.llm_dry_run:
             return ""
@@ -143,7 +146,7 @@ class LLMClient:
         url = f"{self.settings.llm_base_url.rstrip('/')}/chat/completions"
         try:
             t0 = time.perf_counter()
-            response = httpx.post(url, headers=self._headers(), json=payload, timeout=self.settings.llm_timeout_seconds)
+            response = httpx.post(url, headers=self._headers(), json=payload, timeout=timeout or self.settings.llm_timeout_seconds)
             response.raise_for_status()
             data = response.json()
         except (httpx.HTTPError, ValueError) as exc:

@@ -231,6 +231,25 @@ def test_narration_is_synthesized_when_model_skips_status_update(tmp_path: Path)
     assert [e["type"] for e in events[1:]] == ["tool_call", "tool_result", "tool_call", "tool_result"]
 
 
+def test_model_generated_narration_is_used_and_precedes_the_tool_call(tmp_path: Path):
+    console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
+    _scripted_llm(console, [
+        _assistant_turn("", [("get_robot_status", {})]),
+        _assistant_turn("Looks good.", []),
+    ])
+    # The fast thinking-off completion supplies the update line.
+    console.services.llm_client.complete = lambda *a, **k: "Let me take a quick look at the robot."
+
+    events: list[dict] = []
+    console.chat("how is it", on_event=events.append)
+
+    types = [e["type"] for e in events]
+    assert types == ["narration", "tool_call", "tool_result"]
+    # Model's phrasing is used (not the deterministic template), and it lands
+    # BEFORE the tool call.
+    assert events[0]["text"] == "Let me take a quick look at the robot."
+
+
 def test_status_only_rounds_do_not_exhaust_the_action_budget(tmp_path: Path):
     console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
     # Five pure-narration rounds must not burn the 4-action budget; the real

@@ -85,6 +85,20 @@ def build_compaction_prompt(history_text: str, instructions: str | None = None) 
     )
 
 
+def build_narration_prompt(user_message: str, action_descriptions: str) -> str:
+    # "/no_think" tells Qwen3 to skip its reasoning block so this stays fast —
+    # it's a quick "what I'm about to do" line, not a decision.
+    return (
+        "You are the assistant controlling a robot, talking to a user. In ONE "
+        "short, casual, present-tense sentence, tell the user what you're ABOUT "
+        "to do next. Reply with ONLY that sentence — no quotes, no preamble, no "
+        "emojis, no lists, no IDs or jargon.\n"
+        f"The user asked: {user_message}\n"
+        f"You are about to: {action_descriptions}\n"
+        "/no_think"
+    )
+
+
 def build_completion_prompt(mission: dict) -> str:
     name = mission.get("name") or "the mission"
     status = mission.get("status", "")
