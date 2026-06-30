@@ -81,6 +81,22 @@ class LLMClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.settings.llm_api_key}"}
 
+    def list_models(self) -> list[str]:
+        """Model ids the server currently exposes (GET /v1/models).
+
+        Used by the TUI's /model command to offer/validate switch targets. Raises
+        WaterClientError on transport failure so the caller can fall back to just
+        showing the active model.
+        """
+        url = f"{self.settings.llm_base_url.rstrip('/')}/models"
+        try:
+            response = httpx.get(url, headers=self._headers(), timeout=self.settings.llm_timeout_seconds)
+            response.raise_for_status()
+            data = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise WaterClientError(f"Could not list models: {exc}") from exc
+        return [m["id"] for m in (data or {}).get("data", []) if m.get("id")]
+
     def chat_with_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.settings.llm_enabled:
             return {"choices": [{"message": {"content": "LLM is disabled.", "tool_calls": []}}]}

@@ -10,8 +10,8 @@ Key safety behaviour:
   run no more mission steps (does NOT halt mid-motion).
 * ``Esc Esc``    -> ask for confirmation, then a soft EMERGENCY stop
   (``/api/estop?flag=true``) that free-stops the robot immediately.
-* Slash commands -> ``/dryrun on|off``, ``/status``, ``/markers``, ``/stop``,
-  ``/release``, ``/help``, ``/quit``.
+* Slash commands -> ``/dryrun on|off``, ``/ip``, ``/model``, ``/status``,
+  ``/markers``, ``/stop``, ``/release``, ``/help``, ``/quit``.
 
 The stop handlers and status polling run off the UI thread, so they respond
 even while the model is still generating a reply.
@@ -53,6 +53,7 @@ HELP_LINES = [
     "  /dryrun [on|off]   show or toggle dry-run (simulated vs live robot)",
     "  /ip [host[:port]]  show or switch the robot address",
     "  /ip <profile>      switch robot + map by profile (primary, secondary)",
+    "  /model [name]      show or switch the LLM (lists what the server offers)",
     "  /status            current robot state",
     "  /markers           known markers and aliases",
     "  /stop              graceful stop: finish the current step, run no more",
@@ -143,6 +144,30 @@ class AgentConsole:
         self.services.client.set_dry_markers(profile.markers)
         loaded = self.services.location_registry.load_marker_map(profile.markers)
         return len(loaded)
+
+    # ----- model selection ----------------------------------------------- #
+    @property
+    def model(self) -> str:
+        return self.services.settings.llm_model
+
+    @property
+    def model_label(self) -> str:
+        """Short, status-bar-friendly form of the active model id (drops the
+        ``org/`` prefix, e.g. ``Qwen3.6-35B-A3B-6bit``)."""
+        return self.model.rsplit("/", 1)[-1]
+
+    def list_models(self) -> list[str]:
+        """Model ids the server offers, or [] if it can't be reached."""
+        try:
+            return self.services.llm_client.list_models()
+        except Exception:  # noqa: BLE001 - offline/dry-run: caller shows current only
+            return []
+
+    def set_model(self, name: str) -> None:
+        # Settings is a shared mutable singleton and LLMClient reads
+        # settings.llm_model on every call, so this redirects all subsequent
+        # planner/chat/title/summary calls to the new model immediately.
+        self.services.settings.llm_model = name
 
     def chat(self, message: str, on_event=None) -> dict[str, Any]:
         llm = self.services.llm_client
@@ -372,6 +397,40 @@ class AgentConsole:
             if target is None:
                 return CommandResult([f"no such chat: {args[0]} (see /chats)"])
             return CommandResult(self.render_history_lines(target), clear=True)
+
+        if cmd in ("model", "models"):
+            available = self.list_models()
+            if not args:
+                lines = [f"active model: [b]{self.model}[/b]"]
+                if available:
+                    lines.append("[b]available[/b] (use /model <name>):")
+                    for mid in available:
+                        here = " [green]● active[/green]" if mid == self.model else ""
+                        lines.append(f"  {mid}{here}")
+                else:
+                    lines.append("[dim](server unreachable — can't list; pass an id to set anyway)[/dim]")
+                return CommandResult(lines)
+            want = args[0]
+            if available:
+                # Match by exact id, then by short name (after '/'), then substring.
+                wl = want.lower()
+                exact = [m for m in available if m == want]
+                short = [m for m in available if m.rsplit("/", 1)[-1].lower() == wl]
+                substr = [m for m in available if wl in m.lower()]
+                matches = exact or short or substr
+                if not matches:
+                    return CommandResult(
+                        [f"no model matches {want!r}. available: " + ", ".join(available)]
+                    )
+                if len(matches) > 1:
+                    return CommandResult(
+                        [f"{want!r} is ambiguous — matches: " + ", ".join(matches)]
+                    )
+                self.set_model(matches[0])
+                return CommandResult([f"model -> [b]{matches[0]}[/b]"])
+            # Server unreachable: trust the user and set the id verbatim.
+            self.set_model(want)
+            return CommandResult([f"model -> [b]{want}[/b] [dim](unverified — server unreachable)[/dim]"])
 
         if cmd in ("help", "?"):
             return CommandResult(list(HELP_LINES))
@@ -733,7 +792,7 @@ if _TEXTUAL_AVAILABLE:
             title = self.ctl.chat_title() or "new chat"
             self.call_from_thread(
                 self.status_widget.update,
-                f"{mode} {addr} · {_format_status(state)}",
+                f"{mode} {addr} · {_format_status(state)} · [dim]{self.ctl.model_label}[/dim]",
             )
             self.call_from_thread(self.ctx_widget.update, ctx)
             self.call_from_thread(self._set_subtitle, title)

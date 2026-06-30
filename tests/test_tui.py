@@ -97,6 +97,35 @@ def test_ip_profile_switches_address_and_map(tmp_path: Path):
     assert console.current_profile() == "primary"
 
 
+def test_model_command_shows_and_switches(tmp_path: Path):
+    console = build_console(tmp_path, llm_model="mlx-community/Qwen3.6-35B-A3B-6bit")
+    # Pretend the server offers two models so matching/validation runs.
+    available = ["mlx-community/Qwen3.6-35B-A3B-6bit", "mlx-community/Qwen2.5-0.5B-Instruct-4bit"]
+    console.list_models = lambda: available  # type: ignore[method-assign]
+
+    out = console.run_command("/model")
+    assert any("Qwen3.6-35B-A3B-6bit" in ln for ln in out.lines)
+    assert any("active" in ln for ln in out.lines)
+
+    # Switch by short-name substring; the active model id changes immediately.
+    res = console.run_command("/model 0.5B")
+    assert console.model == "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+    assert "Qwen2.5-0.5B-Instruct-4bit" in res.lines[0]
+
+    # Unknown target is rejected, leaving the model unchanged.
+    res = console.run_command("/model gpt-9")
+    assert "no model matches" in res.lines[0]
+    assert console.model == "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+
+
+def test_model_command_sets_verbatim_when_server_unreachable(tmp_path: Path):
+    console = build_console(tmp_path)
+    console.list_models = lambda: []  # type: ignore[method-assign]
+    res = console.run_command("/model some-org/Custom-Model")
+    assert console.model == "some-org/Custom-Model"
+    assert "unverified" in res.lines[0]
+
+
 def test_meta_commands(tmp_path: Path):
     console = build_console(tmp_path)
     assert console.run_command("/help").lines

@@ -26,15 +26,19 @@ class Settings(BaseSettings):
 
     llm_base_url: str = "http://localhost:8080/v1"
     llm_api_key: str = "local-llama"
-    llm_model: str = "mlx-community/Qwen3-32B-4bit"
+    # Default to the Qwen3.6-35B-A3B MoE (6-bit MLX) served on the Mac Studio —
+    # an adaptive-thinking model that sustains ~80 tok/s decode there. Switch at
+    # runtime with /model in the TUI (see app/tui.py).
+    llm_model: str = "mlx-community/Qwen3.6-35B-A3B-6bit"
     llm_enabled: bool = True
     llm_dry_run: bool = False
     llm_timeout_seconds: float = 120.0
     llm_max_tokens: int = 1024
-    # Total context window of the served model (Qwen3-32B-4bit reports
-    # max_position_embeddings=40960). Used as the denominator for the live
-    # context-fullness gauge and the auto-compact trigger.
-    llm_context_window: int = 40960
+    # Usable context window of the served model. The model itself reports
+    # max_position_embeddings=262144, but the mlx server is launched with
+    # --max-kv-size 32768, so 32768 is the real ceiling. Used as the denominator
+    # for the live context-fullness gauge and the auto-compact trigger.
+    llm_context_window: int = 32768
     # Compact the conversation once a turn's prompt tokens reach this fraction
     # of the context window, keeping the most recent turns verbatim.
     auto_compact_threshold: float = 0.8
