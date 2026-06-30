@@ -213,6 +213,24 @@ def test_chat_streams_events_and_status_update_is_narration_not_a_tool(tmp_path:
     assert [c["name"] for c in result["tool_calls"]] == ["get_robot_status"]
 
 
+def test_narration_is_synthesized_when_model_skips_status_update(tmp_path: Path):
+    console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
+    # Model goes straight to tools with no status_update and no content preamble.
+    _scripted_llm(console, [
+        _assistant_turn("", [("get_robot_status", {}), ("list_locations", {})]),
+        _assistant_turn("All set.", []),
+    ])
+
+    events: list[dict] = []
+    console.chat("tell me about the robot", on_event=events.append)
+
+    # A narration is still emitted BEFORE the tool calls, built from the tools.
+    assert events[0]["type"] == "narration"
+    assert "check the robot's status" in events[0]["text"]
+    assert "look up where it can go" in events[0]["text"]
+    assert [e["type"] for e in events[1:]] == ["tool_call", "tool_result", "tool_call", "tool_result"]
+
+
 def test_status_only_rounds_do_not_exhaust_the_action_budget(tmp_path: Path):
     console = build_console(tmp_path, llm_enabled=True, llm_dry_run=False)
     # Five pure-narration rounds must not burn the 4-action budget; the real

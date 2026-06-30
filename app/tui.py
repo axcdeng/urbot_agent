@@ -450,8 +450,11 @@ if _TEXTUAL_AVAILABLE:
 
     class AlexAgentTUI(App):
         CSS = """
-        #log { height: 1fr; border: round $primary; padding: 0 1; }
-        #thinking { height: 1; color: $warning; padding: 0 1; }
+        /* Chat box wraps the transcript AND the live thinking line so the
+           spinner reads as the tail of the conversation, not bottom chrome. */
+        #chat { height: 1fr; border: round $primary; }
+        #log { height: 1fr; padding: 0 1; background: transparent; }
+        #thinking { height: auto; color: $text-muted; padding: 0 1; background: transparent; }
         #status { height: 1; background: $panel; color: $text; padding: 0 1; }
         #prompt { dock: bottom; }
         /* Footer + a right-aligned context gauge share the bottom line. */
@@ -500,8 +503,9 @@ if _TEXTUAL_AVAILABLE:
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
             with Vertical():
-                yield RichLog(id="log", markup=True, wrap=True, highlight=False)
-                yield Static("", id="thinking")
+                with Vertical(id="chat"):
+                    yield RichLog(id="log", markup=True, wrap=True, highlight=False)
+                    yield Static("", id="thinking")
                 yield Static("", id="status")
                 yield Input(placeholder="Message the agent, or /help …", id="prompt")
             with Horizontal(id="footerbar"):
@@ -555,6 +559,9 @@ if _TEXTUAL_AVAILABLE:
                 self._write("[yellow]still working on the previous message…[/yellow]")
                 return
             self._write(f"[b cyan]you[/b cyan] {text}")
+            # Instant acknowledgement so the user gets feedback before the model
+            # (which can take several seconds) produces its first output.
+            self._write("[b green]agent[/b green] On it.")
             self._busy = True
             self._think_start = self._segment_start = time.monotonic()
             self._chat_worker(text)

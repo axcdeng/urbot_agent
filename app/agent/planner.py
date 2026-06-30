@@ -13,6 +13,43 @@ from app.robot.state_manager import StateManager
 from app.water.schemas import WaterClientError
 
 
+def _describe_action(name: str, args: dict[str, Any]) -> str:
+    """A short, plain fragment for what a tool is about to do — used to narrate
+    a turn when the model didn't supply its own update."""
+    if name == "move_to_location":
+        where = args.get("location_name")
+        return f"send the robot to {where}" if where else "send the robot to its destination"
+    return {
+        "get_robot_status": "check the robot's status",
+        "list_locations": "look up where it can go",
+        "create_mission": "set up the mission",
+        "cancel_current_task": "stop the current move",
+        "return_to_charger": "send it to charge",
+        "emergency_stop": "stop the robot right away",
+        "release_emergency_stop_confirmed": "release the emergency stop",
+        "get_mission_status": "check on the mission",
+        "list_missions": "look up recent missions",
+    }.get(name, "take care of that")
+
+
+def _narrate_actions(action_calls: list[tuple]) -> str:
+    """One casual sentence describing the (non-narration) tools about to run."""
+    fragments: list[str] = []
+    for _tc, name, args in action_calls:
+        fragment = _describe_action(name, args)
+        if fragment not in fragments:
+            fragments.append(fragment)
+    if not fragments:
+        return "On it."
+    if len(fragments) == 1:
+        joined = fragments[0]
+    elif len(fragments) == 2:
+        joined = f"{fragments[0]} and {fragments[1]}"
+    else:
+        joined = ", ".join(fragments[:-1]) + f", and {fragments[-1]}"
+    return f"I'll {joined}."
+
+
 class AgentPlanner:
     def __init__(
         self,
@@ -136,17 +173,38 @@ class AgentPlanner:
                 }
             )
 
-            did_action = False
+            # Pre-parse the round so we can guarantee a short "what I'm about to
+            # do" line BEFORE the tool calls — using the model's own words when
+            # it offered them (a content preamble or status_update), otherwise a
+            # deterministic line built from the tools themselves. The local model
+            # often skips status_update, so we never rely on it.
+            parsed: list[tuple[dict, str, dict]] = []
+            narrations: list[str] = []
+            if content.strip():
+                narrations.append(content.strip())
             for tool_call in tool_calls:
                 function = tool_call.get("function", {})
                 name = function.get("name")
                 arguments = function.get("arguments") or "{}"
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
-
                 if name == "status_update":
-                    # Narration only: surface to the user, ack to the model, and
-                    # do NOT record it as a tool call or count it as an action.
-                    emit({"type": "narration", "text": str(parsed_arguments.get("message", "")).strip()})
+                    text = str(parsed_arguments.get("message", "")).strip()
+                    if text:
+                        narrations.append(text)
+                parsed.append((tool_call, name, parsed_arguments))
+
+            action_calls = [(tc, n, a) for (tc, n, a) in parsed if n != "status_update"]
+            if narrations:
+                for text in narrations:
+                    emit({"type": "narration", "text": text})
+            elif action_calls:
+                emit({"type": "narration", "text": _narrate_actions(action_calls)})
+
+            did_action = False
+            for tool_call, name, parsed_arguments in parsed:
+                if name == "status_update":
+                    # Narration already surfaced above; just ack it to the model
+                    # and don't record it as a tool call or count it as an action.
                     messages.append(
                         {
                             "role": "tool",
